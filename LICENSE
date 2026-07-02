@@ -1,0 +1,25 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The PC110 device models in qemu/hw-misc/ and the tools/scripts in this
+repository are free software; you can redistribute them and/or modify them
+under the terms of the GNU General Public License as published by the Free
+Software Foundation; either version 2 of the License, or (at your option) any
+later version.  This matches the license of QEMU, into which the device models
+are compiled.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+The full text of the GNU General Public License version 2 is available at:
+    https://www.gnu.org/licenses/gpl-2.0.html
+
+-------------------------------------------------------------------------------
+
+NOT COVERED BY THIS LICENSE:
+
+IBM PC110 ROM images (system BIOS, kanji font ROM), PC DOS, and Personaware are
+copyrighted by IBM and their respective owners. They are NOT part of this
+repository and are NOT licensed here. You must supply your own legally obtained
+dumps. "IBM", "PC110", and "Personaware" are trademarks of their owners; their
+use here is descriptive only.

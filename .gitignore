@@ -1,0 +1,19 @@
+# Fetched QEMU source tree + build output (rebuilt by scripts/build-qemu.sh)
+/qemu-src/
+/qemu-*.tar.xz
+
+# Copyrighted IBM ROM dumps — you supply these locally (see roms/README.md)
+/roms/*
+!/roms/README.md
+
+# Boot media / disk images — you supply or generate these (see disks/README.md)
+/disks/*
+!/disks/README.md
+
+# Generated build artifacts
+/boot/easysetup.bin
+/boot/setupboot-floppy.bin
+
+# misc
+*.ppm
+.DS_Store
