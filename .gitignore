@@ -9,6 +9,8 @@
 # Boot media / disk images — you supply or generate these (see disks/README.md)
 /disks/*
 !/disks/README.md
+!/disks/Personaware-disk.img
+!/disks/easysetup-floppy.img
 
 # Generated build artifacts
 /boot/easysetup.bin
@@ -17,3 +19,7 @@
 # misc
 *.ppm
 .DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc
