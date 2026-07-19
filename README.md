@@ -43,7 +43,15 @@ takes two complementary approaches:
 | --- | --- | --- |
 | `pc110-fontrom` | `0x1160`–`0x1163`, mem `0xDE000` | Banked 1 MiB kanji font ROM window |
 | `pc110-chipset` | `0x4F`, `0x74/76`, `0xEC/ED`, `0x15E8`, `0x35EA`, `0x80`–`0x8F` | VLSI/SCAMP + power-MCU shim, optional full-ROM shadow overlay (for experiments booting the real BIOS) |
-| `pc110-setupcfg` | `0x4F`, `0x70/71`, `0xEC/ED` | SeaBIOS-safe config-register + power-MCU interface used by Easy-Setup |
+
+> Easy-Setup needs **no custom device** — it runs on stock QEMU/SeaBIOS. Which
+> screen it shows depends on the **boot device type**: booted as a floppy it
+> shows the config menu; booted as a hard disk it shows its built-in
+> hardware-diagnostics page. (An earlier `pc110-setupcfg` device that tried to
+> drive the menu via config registers was a dead end and has been removed.) A
+> minimal, dependency-free variant of just the Easy-Setup path lives in the
+> companion repo **[pc110-easysetup-seabios](https://github.com/ahmadexp/pc110-easysetup-seabios)**,
+> including USB/CompactFlash boot media for real hardware (e.g. Vortex86 boards).
 
 ### Easy-Setup exit path (`boot/`)
 

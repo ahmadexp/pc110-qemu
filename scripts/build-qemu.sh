@@ -26,11 +26,10 @@ fi
 echo ">> installing PC110 device models ..."
 cp "$ROOT/qemu/hw-misc/pc110-fontrom.c"  "$SRC/hw/misc/"
 cp "$ROOT/qemu/hw-misc/pc110-chipset.c"  "$SRC/hw/misc/"
-cp "$ROOT/qemu/hw-misc/pc110-setupcfg.c" "$SRC/hw/misc/"
 
 # --- register them in hw/misc/meson.build (idempotent) ---
 MB="$SRC/hw/misc/meson.build"
-for f in pc110-fontrom pc110-chipset pc110-setupcfg; do
+for f in pc110-fontrom pc110-chipset; do
   if ! grep -q "$f.c" "$MB"; then
     printf "system_ss.add(when: 'CONFIG_ISA_BUS', if_true: files('%s.c'))\n" "$f" >> "$MB"
   fi
