@@ -86,22 +86,56 @@ python3 tools/make-disk.py your-pc110-dump.img disks/Personaware-disk.img
 ./boot/build-floppy.sh
 
 # 4. Run
-./scripts/run-personaware.sh     # Personaware GUI
+./scripts/run-personaware.sh     # Personaware GUI (SeaBIOS)
 ./scripts/run-easysetup.sh       # Easy-Setup BIOS (Exit -> Personaware)
+./scripts/run-realbios.sh        # boot the REAL BIOS (experimental, see below)
 ```
 
-The QEMU window opens with `zoom-to-fit` on — drag a corner to enlarge, or press
-Ctrl+Cmd+F for full screen. Quit with Ctrl+Cmd+Q.
+The QEMU window opens at 2x the guest resolution (the PC110 screen is tiny on a
+high-DPI/Retina Mac); set `QEMU_COCOA_SCALE=N` to change it (1 = native). It is
+still freely resizable — drag a corner, or press Ctrl+Cmd+F for full screen.
+Quit with Ctrl+Cmd+Q.
+
+## Booting the real BIOS (experimental)
+
+`scripts/run-realbios.sh` boots the genuine 256 KiB PC110 BIOS on QEMU instead
+of SeaBIOS. This is a work in progress, but it now gets a long way:
+
+- **POST completes** — memory sizing, chipset self-tests, the timer/refresh
+  calibration, the Chips & Technologies flat-panel VGA BIOS (video mode set),
+  and the KBC warm-reset state machine all pass.
+- **DOS boots** — a software `INT 19h`/`INT 13h` service loads the boot sector
+  and services disk I/O out of the disk image, and the MS-DOS 7 kernel plus the
+  `CONFIG.SYS` driver stack (HIMEM, EMM386, the RIOS `$FONT`/`$DISP`/`$IAS`
+  drivers) load and run.
+- **Not yet: the Personaware desktop.** During driver init a RIOS PC110 driver
+  takes a code path that dives into a BIOS extension and ends in a POST
+  re-entry, which the reference emulator's path avoids. This is a long tail of
+  small chipset/BIOS-fidelity gaps rather than one missing feature.
+
+How it works (`qemu/target-i386/pc110post.c`, applied via `qemu/patches/`):
+
+- A TCG-level completer hooked into the CPU exec loop (enabled by the
+  `PC110POST` env var) short-circuits POST wait-loops that never converge under
+  emulation, seeds the warm-boot contract (`40:72 = 1234h`) around the KBC
+  CPU-reset, and services `INT 19h`/`INT 13h` from `$PC110BOOT`.
+- The KBC `0xFE` reset is turned into a synchronous **CPU-only** reset (RAM
+  preserved) instead of QEMU's async full-machine reset, matching the 286-era
+  protected-mode-exit idiom the BIOS/driver rely on.
+- `pc110-chipset` supplies the ROM/shadow map (C0000-DFFFF ROM, E0000-EFFFF a
+  DOS UMB that becomes writable after boot, F0000-FFFFF shadow RAM) and the
+  VLSI/SCAMP + CMOS register banks seeded from a real-hardware dump.
+
+Set `PC110RSTLOG=1` for verbose reset/driver tracing (used while chasing the
+remaining divergence).
 
 ## Status / limitations
 
+- **Personaware** (SeaBIOS) and **Easy-Setup** are the fully working paths.
 - Easy-Setup renders and its menu is navigable, but it still calls a few PC110
   BIOS service routines that don't exist under SeaBIOS, so some in-menu actions
   may not fully function; entering it and exiting back to Personaware work.
-- Booting the *entire* real PC110 BIOS on QEMU (full POST → boot) is not
-  finished — the `pc110-chipset` device carries the groundwork (chipset shims,
-  ROM/shadow overlay) but the POST memory test and the C&T flat-panel VGA
-  mode-set remain.
+- The real-BIOS path (above) boots DOS but does not yet reach the desktop.
 
 ## Credits
 

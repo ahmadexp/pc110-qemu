@@ -59,13 +59,22 @@ struct PC110ChipsetState {
     /* optional full-ROM overlay at 0xC0000-0xFFFFF */
     char *biosfile;
     char *biospatch;   /* "off=hex,off=hex" byte patches applied to the ROM */
-    MemoryRegion biosmap;
+    char *vgac000;     /* if set: place the C&T VGA BIOS (ROM 0x20000) at 0xC0000 */
+    MemoryRegion biosrom;   /* C0000-DFFFF read-only ROM (matches real POST) */
+    MemoryRegion biosEram;  /* E0000-EFFFF ROM in POST, writable DOS UMB post-boot */
+    MemoryRegion biosram;   /* F0000-FFFFF writable shadow RAM */
 
     /* DMA page registers 0x80-0x8F as plain R/W scratch (PC110 POST tests these) */
     uint8_t dma_page[16];
 
-    /* config latch 0x4F */
+    /* config latch 0x4F + config-register data via 0x71 when armed */
     uint8_t config_index;
+    bool    config_armed;
+    uint8_t config_regs[256];
+
+    /* CMOS/RTC 0x70/0x71 (seeded from real hardware) */
+    uint8_t rtc_index;
+    uint8_t cmos[128];
 
     /* SCAMP/VLSI 0x74/0x76 */
     uint8_t scamp_index;
@@ -87,38 +96,34 @@ struct PC110ChipsetState {
     uint32_t status_15e8_reads;
     uint32_t status_15ec_reads;
 
+    /* PCIC/PCMCIA-style indexed window 0x3E0(index)/0x3E1(data) */
+    uint8_t pcic_index;
+    uint8_t pcic_regs[256];
+
+    /* SCAMP-style indexed window 0x3F0(index)/0x3F1(data) */
+    uint8_t fdcw_index;
+    uint8_t fdcw_regs[256];
+
     MemoryRegion io_80;
     MemoryRegion io_4f;
+    MemoryRegion io_70;
     MemoryRegion io_74;
     MemoryRegion io_ec;
     MemoryRegion io_ee;
     MemoryRegion io_15e8;
     MemoryRegion io_35ea;
+    MemoryRegion io_3e0;
+    MemoryRegion io_3f0;
 };
 
 /*
- * Power-sense MCU indexed value.  The real BIOS reads an identity block; we
- * report a "present" MCU with a small synthetic firmware id, mirroring the
- * PC110-EMU model closely enough to satisfy the presence checks.
+ * Power-sense MCU indexed register file (0xEC index / 0xED data).  Plain R/W,
+ * preloaded with the live-hardware dump — matching the oracle's indexed_ed[].
+ * (No synthetic identity: the BIOS reads back the real config bytes.)
  */
-static const char MCU_FW_ID[] = "PC110-PMCU";
-
 static uint8_t mcu_indexed_value(PC110ChipsetState *s, uint8_t index)
 {
-    if (index >= 0x80 && index < 0xE0) {
-        size_t off = index - 0x80;
-        return off < strlen(MCU_FW_ID) ? (uint8_t)MCU_FW_ID[off] : 0x00;
-    }
-    switch (index) {
-    case 0xF0: return 'M';
-    case 0xF1: return 'C';
-    case 0xF2: return 'U';
-    case 0xF3: return 0x08;                 /* firmware revision */
-    case 0xF9: return 0x81;                 /* present/ready */
-    case 0xFC: return (uint8_t)strlen(MCU_FW_ID);
-    case 0xFF: return 0xA5;                  /* present signature */
-    default:   return s->mcu_regs[index];
-    }
+    return s->mcu_regs[index];
 }
 
 /* ---- 0x80-0x8F DMA page registers as plain R/W scratch ---- */
@@ -131,14 +136,69 @@ static void dpage_write(void *o, hwaddr a, uint64_t v, unsigned sz)
     ((PC110ChipsetState *)o)->dma_page[a & 0x0F] = v;
 }
 
-/* ---- 0x4F config latch ---- */
+/* ---- 0x4F config latch: select config-register index and ARM config mode ---- */
 static uint64_t cfg_read(void *o, hwaddr a, unsigned sz)
 {
     return ((PC110ChipsetState *)o)->config_index;
 }
 static void cfg_write(void *o, hwaddr a, uint64_t v, unsigned sz)
 {
-    ((PC110ChipsetState *)o)->config_index = v;
+    PC110ChipsetState *s = o;
+    /*
+     * 0x4F is a SEPARATE config-register index latch (the reference emulator's
+     * pc110_config_index).  It only redirects 0x71 to the config bank while in
+     * Easy-Setup mode (real_setup_mode==2), which normal POST never enters, so
+     * during boot 0x71 is always ordinary CMOS.  It must NOT clobber rtc_index:
+     * the CMOS access helper writes the index to both 0x70 and 0x4F, and it is
+     * the 0x70 write that selects the CMOS byte.
+     */
+    s->config_index = v;
+}
+
+/* ---- 0x70/0x71 CMOS/RTC + config-register data (when 0x4F armed) ---- */
+static uint8_t cmos_get(PC110ChipsetState *s, uint8_t idx)
+{
+    switch (idx & 0x7F) {
+    case 0x0A: return s->cmos[0x0A] & 0x7F;   /* clear UIP */
+    case 0x0C: return 0x00;
+    case 0x0D: return 0x80;                    /* battery/RAM valid */
+    default:   return s->cmos[idx & 0x7F];
+    }
+}
+/*
+ * Data port 0x71 routes to the config-register bank when the active index has
+ * bit7 set (0x80-0xFF are the PC110 extended/config registers) OR when config
+ * mode was armed via 0x4F; otherwise it is ordinary CMOS (index 0x00-0x7F).
+ * The active index is the config index while armed, else the RTC index (0x70).
+ */
+/*
+ * 0x71 is ordinary CMOS: index bit7 is the NMI-disable bit (masked off for the
+ * CMOS address), NOT a bank selector.  The index is set by 0x70 and mirrored to
+ * 0x4F on every access, so 0x71 always reads/writes CMOS[index & 0x7F].
+ */
+static uint64_t rtc_read(void *o, hwaddr a, unsigned sz)
+{
+    PC110ChipsetState *s = o;
+    if (a == 0) {                             /* 0x70 index */
+        return s->rtc_index;
+    }
+    uint8_t idx = s->rtc_index & 0x7F, val = cmos_get(s, idx);
+    if (idx == 0x0F && getenv("PC110RSTLOG")) {
+        fprintf(stderr, "[pc110chip] CMOS[0F] read  -> %02X\n", val);
+    }
+    return val;
+}
+static void rtc_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{
+    PC110ChipsetState *s = o;
+    if (a == 0) {                             /* 0x70 index (bit7 = NMI disable) */
+        s->rtc_index = v;
+        return;
+    }
+    if ((s->rtc_index & 0x7F) == 0x0F && getenv("PC110RSTLOG")) {
+        fprintf(stderr, "[pc110chip] CMOS[0F] write <- %02X\n", (uint8_t)v);
+    }
+    s->cmos[s->rtc_index & 0x7F] = v;
 }
 
 /* ---- 0x74/0x76 SCAMP ---- */
@@ -149,7 +209,17 @@ static uint64_t scamp_read(void *o, hwaddr a, unsigned sz)
         return s->scamp_index;
     }
     if (a == 2) {                             /* 0x76 data */
-        return s->scamp_regs[s->scamp_index & 0x7F];
+        uint8_t idx = s->scamp_index & 0x7F;
+        if (getenv("PC110SCAMPLOG")) {
+            static uint32_t cnt[128];
+            static uint8_t logged[128];
+            if (++cnt[idx] == 100000 && !logged[idx]) {
+                logged[idx] = 1;
+                fprintf(stderr, "[scamp] index %02X polled 100000x, value=%02X\n",
+                        idx, s->scamp_regs[idx]);
+            }
+        }
+        return s->scamp_regs[idx];
     }
     return 0xFF;
 }
@@ -245,6 +315,33 @@ static void ext35_write(void *o, hwaddr a, uint64_t v, unsigned sz)
     }
 }
 
+/* ---- 0x3E0/0x3E1 (PCMCIA ExCA) and 0x3F0/0x3F1 (below-FDC) ----
+ * The reference emulator leaves all four ports UNMAPPED-equivalent: reads
+ * return a fixed 0xFF and writes are dropped (0x3E0/0x3E1 = PCMCIA ExCA
+ * placeholder; 0x3F0/0x3F1 are not the FDC — the FDC is 0x3F2-0x3F7).  We
+ * still register 0x3F0/0x3F1 to shadow QEMU's FDC decode there so they read
+ * 0xFF exactly like the real machine's unclaimed ports.  (The BIOS's
+ * 0x55/0xAA presence probes here are informational; POST does not gate on the
+ * readback — it boots on the real hardware with these reading 0xFF.) */
+static uint64_t ff_read(void *o, hwaddr a, unsigned sz)
+{
+    return 0xFF;
+}
+static void ff_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{
+}
+
+static const MemoryRegionOps pcic_ops = {
+    .read = ff_read, .write = ff_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 1,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+static const MemoryRegionOps fdcw_ops = {
+    .read = ff_read, .write = ff_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 1,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static const MemoryRegionOps dpage_ops = {
     .read = dpage_read, .write = dpage_write,
     .valid.min_access_size = 1, .valid.max_access_size = 1,
@@ -252,6 +349,11 @@ static const MemoryRegionOps dpage_ops = {
 };
 static const MemoryRegionOps cfg_ops = {
     .read = cfg_read, .write = cfg_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 1,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+static const MemoryRegionOps rtc_ops = {
+    .read = rtc_read, .write = rtc_write,
     .valid.min_access_size = 1, .valid.max_access_size = 1,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
@@ -281,6 +383,55 @@ static const MemoryRegionOps ext35_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * E-segment (E0000-EFFFF) write policy.  On the real PC110 (and the PC110-EMU
+ * reference) this window is READ-ONLY option/adapter-ROM space during POST, but
+ * becomes a WRITABLE DOS Upper Memory Block once the OS has booted (the DOS
+ * kernel/driver relocates code there and, e.g., a driver checksum routine writes
+ * a byte back to E000:FFFF).  Modeled as a rom_device: reads are served directly
+ * from the RAM backing (executable), writes come here.  Drop writes until boot
+ * (so POST memory-sizing still classifies E as ROM); apply them afterwards.
+ * pc110_booted is set by the INT19 handler in target/i386/pc110post.c. */
+extern int pc110_booted;
+static void eram_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{
+    PC110ChipsetState *s = o;
+    if (!pc110_booted) {
+        return; /* POST: E-segment is read-only ROM */
+    }
+    if (a + sz <= 0x10000) {
+        uint8_t *ram = memory_region_get_ram_ptr(&s->biosEram);
+        for (unsigned i = 0; i < sz; i++) {
+            ram[a + i] = (uint8_t)(v >> (8 * i));
+        }
+        if (getenv("PC110RSTLOG")) {
+            static unsigned ew;
+            if (ew < 12 || (ew % 4096) == 0) {
+                fprintf(stderr, "[pc110chip] E-seg write #%u  E000:%04X <- %02X\n",
+                        ew, (unsigned)a, (unsigned)(v & 0xFF));
+            }
+            ew++;
+        }
+    }
+}
+static uint64_t eram_read(void *o, hwaddr a, unsigned sz)
+{
+    /* rom_device serves reads directly from the RAM backing; this is only a
+     * fallback and should not normally be reached. */
+    PC110ChipsetState *s = o;
+    uint64_t r = 0;
+    const uint8_t *ram = memory_region_get_ram_ptr(&s->biosEram);
+    for (unsigned i = 0; i < sz && a + i < 0x10000; i++) {
+        r |= (uint64_t)ram[a + i] << (8 * i);
+    }
+    return r;
+}
+static const MemoryRegionOps eram_ops = {
+    .read = eram_read, .write = eram_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 1,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
 {
     ISADevice *isadev = ISA_DEVICE(d);
@@ -289,12 +440,94 @@ static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
 
     s->status_15ec = 0x02;                    /* start "busy", settles on read */
 
+    /*
+     * Seed SCAMP/VLSI and power-MCU indexed registers with values read from
+     * the live PC110 hardware, so POST's memory-sizing and config-detect loops
+     * see real chipset state instead of zeros (which never satisfy the checks).
+     */
+    {
+        /*
+         * FULL 128-byte SCAMP (0x74/0x76) bank captured live from the real
+         * PC110 over COMrade (2026-07-20).  The high indices hold the config
+         * signature a Win95 driver's verify routine (F000:3A56) checks:
+         * SCAMP[0x77]=0x4F, [0x7A]=0x53/[0x7B]=0x4C ('SL'=0x534C),
+         * [0x7E]=0x15/[0x7F]=0xEE (must equal CMOS[0x7E/7F]), [0x0D]=0x93/
+         * [0x0E]=0xE5.  With the old 32-byte seed the rest read 0, the verify
+         * failed, and the driver spun forever.
+         */
+        static const uint8_t scamp_seed[0x80] = {
+            0x00,0xBB,0x80,0x00,0xFF,0xFF,0xFF,0xFF,
+            0xFF,0xFF,0xFF,0xFF,0xFF,0x93,0xE5,0x50,
+            0x80,0x00,0x00,0x90,0xF0,0xE0,0xA1,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x8E,0x02,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x98,0x8A,
+            0x10,0x14,0x10,0x20,0x08,0xBA,0x9E,0xF1,
+            0x5A,0x50,0xF1,0x3C,0x0A,0x1E,0x2C,0x01,
+            0x02,0x05,0x01,0x88,0x03,0x00,0x00,0x00,
+            0x00,0x0A,0x03,0x88,0x05,0x00,0x00,0x00,
+            0x08,0x1E,0x11,0x88,0x11,0x00,0x00,0x00,
+            0x0C,0x00,0x00,0x88,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x10,0x4F,
+            0x0F,0x10,0x53,0x4C,0x00,0x10,0x15,0xEE,
+        };
+        static const uint8_t mcu_seed[0x20] = {
+            0x42,0xd5,0x0b,0x00,0x06,0xa8,0x1a,0xec,
+            0x38,0x00,0x03,0x00,0x29,0x00,0x00,0x2a,
+            0x00,0x00,0xaa,0x55,0x55,0x6a,0x55,0x55,
+            0xaa,0x1a,0x04,0x08,0x74,0x00,0x00,0x00,
+        };
+        /*
+         * FULL 128-byte CMOS (0x70/0x71) bank captured live from the real
+         * PC110 over COMrade (2026-07-20).  Matches the real machine exactly:
+         *   0x15/16=0280 (640 KB base)   0x17/18=0C00 (3072 KB ext = 4 MB box)
+         *   -> run QEMU with -m 4 (4096 KB total -> 3072 KB above 1 MB).
+         * The driver verify (F000:3A56) also checks CMOS[0x0E].7 (=0, clear)
+         * and CMOS[0x7E]=0x15/[0x7F]=0xEE (== SCAMP[0x7E/7F]).  0x00-0x09 are the
+         * live clock (BCD) at capture time.
+         */
+        static const uint8_t cmos_seed[0x80] = {
+            0x08,0x02,0x55,0x00,0x22,0x00,0x06,0x14,
+            0x01,0x94,0x26,0x02,0x50,0x80,0x00,0x00,
+            0x40,0x00,0xFF,0x00,0x25,0x80,0x02,0x00,
+            0x0C,0x7F,0x7F,0x00,0x00,0x98,0x77,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x03,0xFF,
+            0x00,0x0C,0x19,0xFF,0x10,0xFF,0xFF,0xFF,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0xE6,0x87,0x1F,0x01,0x50,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x0F,0x07,0x32,
+            0x17,0x1F,0x3A,0x2F,0x37,0x3F,0x47,0x2A,
+            0x56,0x5E,0x6E,0x65,0x6F,0x6D,0x67,0x64,
+            0x00,0x00,0xC7,0x0C,0x1F,0xFF,0xFF,0xFF,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x10,0x48,0xA6,0x00,0x00,0x00,
+            0x00,0x00,0x32,0x02,0x04,0x2B,0x15,0xEE,
+        };
+        static const uint8_t ext35_seed[0x20] = {
+            0x00,0xff,0xf5,0xff,0x87,0xf3,0x6c,0xfd,
+            0xff,0xf7,0xff,0xfc,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xe8,0x35,0x04,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+        };
+        memcpy(s->scamp_regs, scamp_seed, sizeof(scamp_seed));
+        memcpy(s->mcu_regs, mcu_seed, sizeof(mcu_seed));
+        memcpy(s->cmos, cmos_seed, sizeof(cmos_seed));
+        memcpy(s->ext35_regs, ext35_seed, sizeof(ext35_seed));
+    }
+
     /* 0x80-0x8F: override QEMU's partial DMA page decode with full R/W scratch */
     memory_region_init_io(&s->io_80, OBJECT(d), &dpage_ops, s, "pc110-dmapage", 16);
     memory_region_add_subregion_overlap(io, 0x80, &s->io_80, 10);
 
     memory_region_init_io(&s->io_4f, OBJECT(d), &cfg_ops, s, "pc110-cfg", 1);
     memory_region_add_subregion(io, 0x4F, &s->io_4f);
+
+    /* 0x70/0x71: CMOS/RTC + config-register data — override QEMU's mc146818 */
+    memory_region_init_io(&s->io_70, OBJECT(d), &rtc_ops, s, "pc110-rtc", 2);
+    memory_region_add_subregion_overlap(io, 0x70, &s->io_70, 10);
 
     /* 0x74..0x76 (index at 0x74, data at 0x76) */
     memory_region_init_io(&s->io_74, OBJECT(d), &scamp_ops, s, "pc110-scamp", 3);
@@ -313,6 +546,14 @@ static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
     /* 0x35EA..0x35EB */
     memory_region_init_io(&s->io_35ea, OBJECT(d), &ext35_ops, s, "pc110-ext35", 2);
     memory_region_add_subregion(io, 0x35EA, &s->io_35ea);
+
+    /* 0x3E0/0x3E1 PCIC-style window (unclaimed by default PC -> add plainly) */
+    memory_region_init_io(&s->io_3e0, OBJECT(d), &pcic_ops, s, "pc110-pcic", 2);
+    memory_region_add_subregion_overlap(io, 0x3E0, &s->io_3e0, 10);
+
+    /* 0x3F0/0x3F1 SCAMP-style window (override default FDC decode at 0x3F0) */
+    memory_region_init_io(&s->io_3f0, OBJECT(d), &fdcw_ops, s, "pc110-fdcw", 2);
+    memory_region_add_subregion_overlap(io, 0x3F0, &s->io_3f0, 10);
 
     /* optional full-ROM overlay at 0xC0000-0xFFFFF */
     if (s->biosfile) {
@@ -353,20 +594,58 @@ static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
         }
 
         /*
-         * On the PC110, C0000-FFFFF is shadow RAM that the BIOS copies itself
-         * into during POST (it copies 0x10000->0xE0000 and verifies).  Model it
-         * as writable RAM pre-loaded with the ROM image, so the shadow-copy
-         * POST step succeeds instead of looping against read-only ROM.
+         * The PC110 BIOS initializes video by 'call far C000:0003' (F000:3F67
+         * / F000:4293), i.e. it expects the C&T VGA BIOS at 0xC0000 (the
+         * standard VGA option-ROM location).  A flat 1:1 map puts the VGA BIOS
+         * (ROM offset 0x20000) at 0xE0000 instead, so the call hits garbage.
+         * When vgac000 is set, copy the 64KB VGA BIOS to the 0xC0000 window so
+         * the video-init far-call reaches it.
          */
-        memory_region_init_ram(&s->biosmap, OBJECT(d), "pc110-bios-cseg",
-                               PC110_BIOS_MAP_SIZE, &error_fatal);
-        memcpy(memory_region_get_ram_ptr(&s->biosmap), contents,
-               PC110_BIOS_MAP_SIZE);
-        g_free(contents);
-        /* priority above isa-bios (1) and the VGA option ROM */
+        if (s->vgac000 && s->vgac000[0]) {
+            memcpy(contents + 0x00000, contents + 0x20000, 0x10000);
+        }
+
+        /*
+         * Memory-window policy MUST match the real PC110 POST (verified against
+         * the PC110-EMU reference): during POST only F0000-FFFFF is writable
+         * shadow RAM (the BIOS relocates and patches POST tables there); the
+         * whole C0000-EFFFF window is READ-ONLY ROM.  This is load-bearing: the
+         * BIOS memory-sizing/test walks the top of memory and writes probe
+         * patterns across C/D/E; on the real machine (and the reference) those
+         * writes are IGNORED (ROM), so the sizer correctly classifies C/D/E as
+         * ROM and moves on.  If C/D/E were writable, the probes succeed, the
+         * E-segment ROM code (e.g. the E900 delay routine reached by a later
+         * CALL FAR E900:xxxx) gets overwritten, and the memory test spins
+         * forever re-running against a corrupted E-segment.
+         *
+         * C0000-DFFFF: read-only ROM (128 KiB).
+         * E0000-EFFFF: rom_device (64 KiB) — read-only ROM during POST, writable
+         *              DOS UMB after boot (see eram_ops / eram_write above).
+         * F0000-FFFFF: writable RAM shadow (64 KiB), pre-loaded from the ROM.
+         */
+        memory_region_init_rom(&s->biosrom, OBJECT(d), "pc110-bios-crom",
+                               0x20000, &error_fatal);
+        memcpy(memory_region_get_ram_ptr(&s->biosrom), contents, 0x20000);
         memory_region_add_subregion_overlap(get_system_memory(),
                                             PC110_BIOS_MAP_BASE,
-                                            &s->biosmap, 20);
+                                            &s->biosrom, 20);
+
+        memory_region_init_rom_device(&s->biosEram, OBJECT(d), &eram_ops, s,
+                                      "pc110-bios-eram", 0x10000, &error_fatal);
+        memcpy(memory_region_get_ram_ptr(&s->biosEram), contents + 0x20000,
+               0x10000);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            PC110_BIOS_MAP_BASE + 0x20000,
+                                            &s->biosEram, 20);
+
+        memory_region_init_ram(&s->biosram, OBJECT(d), "pc110-bios-fram",
+                               0x10000, &error_fatal);
+        memcpy(memory_region_get_ram_ptr(&s->biosram), contents + 0x30000,
+               0x10000);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            PC110_BIOS_MAP_BASE + 0x30000,
+                                            &s->biosram, 20);
+        g_free(contents);
     }
 }
 
@@ -393,6 +672,7 @@ static const VMStateDescription vmstate_pc110_chipset = {
 static const Property pc110_chipset_properties[] = {
     DEFINE_PROP_STRING("biosfile", PC110ChipsetState, biosfile),
     DEFINE_PROP_STRING("biospatch", PC110ChipsetState, biospatch),
+    DEFINE_PROP_STRING("vgac000", PC110ChipsetState, vgac000),
 };
 
 static void pc110_chipset_class_initfn(ObjectClass *klass, const void *data)

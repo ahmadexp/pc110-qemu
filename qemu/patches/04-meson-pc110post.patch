@@ -1,0 +1,10 @@
+--- a/target/i386/meson.build
++++ b/target/i386/meson.build
+@@ -5,6 +5,7 @@
+   'helper.c',
+   'xsave_helper.c',
+   'cpu-dump.c',
++  'pc110post.c',
+ ))
+ i386_ss.add(when: 'CONFIG_SEV', if_true: files('host-cpu.c', 'confidential-guest.c'))
+ 

@@ -1,0 +1,65 @@
+--- a/hw/input/pckbd.c
++++ b/hw/input/pckbd.c
+@@ -301,13 +301,32 @@
+     return b;
+ }
+ 
++/*
++ * PC110 KBC reset routing.  On the real IBM PC110 the KBC 0xFE (and the output-
++ * port reset-line) pulse the CPU reset line only — a CPU reset, NOT a full
++ * machine reset; RAM and chipset state persist so the ROM warm-POST can resume.
++ * QEMU's default here is qemu_system_reset_request(), an ASYNC FULL-MACHINE reset
++ * that wipes RAM.  The BIOS uses this reset both in POST and (critically) from
++ * the Personaware driver as the 286-era protected-mode-exit idiom; a full reset
++ * there destroys the running DOS.  In PC110POST mode, defer to a synchronous
++ * CPU-only reset consumed at the next TB boundary in target/i386/pc110post.c. */
++extern int pc110_kbc_reset_pending;
++static void pc110_kbc_cpu_reset_or_system(void)
++{
++    if (getenv("PC110POST")) {
++        pc110_kbc_reset_pending = 1;
++    } else {
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++    }
++}
++
+ static void outport_write(KBDState *s, uint32_t val)
+ {
+     trace_pckbd_outport_write(val);
+     s->outport = val;
+     qemu_set_irq(s->a20_out, (val >> 1) & 1);
+     if (!(val & 1)) {
+-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++        pc110_kbc_cpu_reset_or_system();
+     }
+ }
+ 
+@@ -384,7 +403,7 @@
+         s->outport &= ~KBD_OUT_A20;
+         break;
+     case KBD_CCMD_RESET:
+-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++        pc110_kbc_cpu_reset_or_system();
+         break;
+     case KBD_CCMD_NO_OP:
+         /* ignore that */
+@@ -475,7 +494,18 @@
+     KBDState *s = opaque;
+ 
+     s->mode = KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT;
+-    s->status = KBD_STAT_CMD | KBD_STAT_UNLOCKED;
++    /*
++     * The IBM PC110's keyboard controller (a MELPS 740 MCU) runs its own
++     * power-on self-test independently of the host, so its status "system
++     * flag" (SYSF, bit 2) is already set by the time the BIOS first reads
++     * port 0x64.  The PC110 POST reads SYSF to choose its boot path: SYSF set
++     * takes the normal (already-sized) path; SYSF clear drives a chipset
++     * memory-sizing loop that depends on PC110-specific SCAMP/power-MCU bank
++     * behaviour and never converges under QEMU.  A stock i8042 leaves SYSF
++     * clear until the guest issues the 0xAA self-test, which is too late, so
++     * seed it here to match the real PC110 controller.
++     */
++    s->status = KBD_STAT_CMD | KBD_STAT_UNLOCKED | KBD_STAT_SELFTEST;
+     s->outport = KBD_OUT_RESET | KBD_OUT_A20 | KBD_OUT_ONES;
+     s->pending = 0;
+     kbd_deassert_irq(s);

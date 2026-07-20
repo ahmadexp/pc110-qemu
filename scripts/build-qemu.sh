@@ -35,6 +35,25 @@ for f in pc110-fontrom pc110-chipset; do
   fi
 done
 
+# --- real-BIOS POST completer + core patches (experimental) ---
+# pc110post.c is the TCG-level POST-loop/INT19/INT13 completer that lets the
+# REAL 256 KiB PC110 BIOS run through POST and boot DOS (enabled at run time via
+# the PC110POST env var).  It is a new target/i386 source plus small in-place
+# edits to QEMU core files (the cpu-exec hook that calls it, the KBC CPU-only
+# reset, the meson registration, and an optional cocoa window-scale).  See
+# README "Booting the real BIOS".
+echo ">> installing PC110 real-BIOS POST completer + patches ..."
+cp "$ROOT/qemu/target-i386/pc110post.c" "$SRC/target/i386/"
+for p in "$ROOT"/qemu/patches/*.patch; do
+  [ -e "$p" ] || continue
+  if patch -p1 -d "$SRC" -N --dry-run < "$p" >/dev/null 2>&1; then
+    patch -p1 -d "$SRC" -N < "$p" >/dev/null
+    echo "   applied $(basename "$p")"
+  else
+    echo "   skip $(basename "$p") (already applied)"
+  fi
+done
+
 # --- configure & build ---
 mkdir -p "$SRC/build"
 cd "$SRC/build"

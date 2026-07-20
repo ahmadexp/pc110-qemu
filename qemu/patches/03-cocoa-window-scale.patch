@@ -1,0 +1,60 @@
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -102,6 +102,14 @@
+ static bool swap_opt_cmd;
+ 
+ static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
++/*
++ * Initial window magnification for the zoom-to-fit (resizable) path.  1.0 keeps
++ * QEMU's default (window opens at the guest's pixel size in points, which on a
++ * high-DPI/Retina Mac is physically tiny).  Set QEMU_COCOA_SCALE=2 to open the
++ * window twice as large; the guest framebuffer is scaled to fill it.  The window
++ * stays freely resizable afterwards.
++ */
++static double cocoa_zoom_scale = 1.0;
+ static NSTextField *pauseLabel;
+ 
+ static bool allow_events;
+@@ -635,6 +643,20 @@
+     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
+         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
+         [[self window] center];
++    } else if (cocoa_zoom_scale != 1.0 && screen.width > 0 && screen.height > 0) {
++        /*
++         * Zoom-to-fit with an explicit magnification (QEMU_COCOA_SCALE): size the
++         * window deterministically to the guest resolution scaled by the factor,
++         * converting guest pixels to points via the backing scale so the physical
++         * size is consistent on Retina and non-Retina displays.
++         */
++        CGFloat bs = [[self window] backingScaleFactor];
++        if (bs < 1.0) {
++            bs = 1.0;
++        }
++        NSSize target = NSMakeSize(screen.width * cocoa_zoom_scale / bs,
++                                   screen.height * cocoa_zoom_scale / bs);
++        [[self window] setContentSize:[self fixAspectRatio:target]];
+     } else {
+         [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+     }
+@@ -2134,6 +2156,21 @@
+         zoom_interpolation = kCGInterpolationLow;
+     }
+ 
++    /* Optional initial window magnification for zoom-to-fit (QEMU_COCOA_SCALE). */
++    {
++        const char *scale_env = getenv("QEMU_COCOA_SCALE");
++        if (scale_env && scale_env[0]) {
++            double v = atof(scale_env);
++            if (v >= 1.0 && v <= 8.0) {
++                cocoa_zoom_scale = v;
++                /* Smooth the upscale so 2x doesn't look blocky. */
++                if (v != 1.0 && zoom_interpolation == kCGInterpolationNone) {
++                    zoom_interpolation = kCGInterpolationLow;
++                }
++            }
++        }
++    }
++
+     create_initial_menus();
+     /*
+      * Create the menu entries which depend on QEMU state (for consoles

@@ -1,0 +1,17 @@
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -961,6 +961,14 @@
+                 break;
+             }
+ 
++            /* PC110 real-BIOS POST completer intercept (i386-softmmu build) */
++            {
++                extern bool pc110_post_intercept(CPUState *cs, vaddr pc);
++                if (pc110_post_intercept(cpu, s.pc)) {
++                    continue;
++                }
++            }
++
+             tb = tb_lookup(cpu, s);
+             if (tb == NULL) {
+                 CPUJumpCache *jc;
