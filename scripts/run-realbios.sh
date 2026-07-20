@@ -24,7 +24,7 @@ BIOS="$ROOT/roms/pc110_bios.bin"
 DISK="$ROOT/disks/Personaware-disk.img"
 FONT="$ROOT/roms/pc110-fontrom.bin"
 
-# The Personaware CF image is 49152 sectors = 768 cyl x 2 heads x 32 secs (24 MB,
+# The Personaware CF image is 15680 sectors = 245 cyl x 2 heads x 32 secs (8 MB,
 # partition at LBA 32); present that geometry explicitly so the software INT13
 # service and the boot chain agree.  QEMU_COCOA_SCALE: see run-personaware.sh.
 exec env PC110POST=1 PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" \
@@ -32,7 +32,7 @@ exec env PC110POST=1 PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}"
   -m 4 -cpu 486 \
   -bios "$BIOS" \
   -drive id=hd0,file="$DISK",format=raw,if=none,snapshot=on \
-  -device ide-hd,drive=hd0,bus=ide.0,unit=0,cyls=768,heads=2,secs=32 \
+  -device ide-hd,drive=hd0,bus=ide.0,unit=0,cyls=245,heads=2,secs=32 \
   -boot c -vga std \
   -device "pc110-chipset,biosfile=$BIOS,vgac000=on" \
   -device pc110-fontrom,romfile="$FONT" \
