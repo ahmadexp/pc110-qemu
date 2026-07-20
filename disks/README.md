@@ -11,6 +11,22 @@ are **not** included in this repository — supply your own.
 If your Personaware dump is already a full disk image (has an MBR / boots on its
 own), you can use it directly as `Personaware-disk.img` and skip `make-disk.py`.
 
+## Disk size / the "low disk space" dialog
+
+Personaware pops a Japanese **"注意 … ディスクの残りが少なく"** ("Caution: disk
+space is running low") dialog at startup when free space is below its threshold.
+A small (~8 MB) reconstructed image trips it even at 60% free; the real unit is
+~20 MB. Building/using a **larger disk clears the warning** — Personaware then
+boots straight to a clean launcher.
+
+To expand an existing image to 24 MB (768 cyl × 2 heads × 32 sec), rebuild it
+onto a bigger FAT16 partition and copy the files back with the IBM PC-DOS system
+files (`IBMBIO.COM`, `IBMDOS.COM`, `COMMAND.COM`) written **first** so they stay
+the first root-directory entries (the boot sector requires `IBMBIO.COM` at slot
+0), keeping the original MBR boot code and boot-sector loader with the new BPB.
+If you change the geometry, update `scripts/run-realbios.sh` (`cyls=`) and the
+FDPT in `qemu/target-i386/pc110post.c` to match.
+
 ## CONFIG.SYS tweak for QEMU
 
 The stock PC110 `CONFIG.SYS` puts the EMS page frame at `FRAME=E000`, which

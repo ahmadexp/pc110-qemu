@@ -213,7 +213,7 @@ static void pc110_int13(CPUX86State *env)
         rah = cf ? 0x04 : 0x00;                   /* 0x04 = sector not found */
         env->regs[R_EAX] = (env->regs[R_EAX] & ~(target_ulong)0xFF) | (got & 0xFF);
     } else if (ah == 0x08) {                      /* get drive parameters */
-        uint32_t max_cyl = 244;                   /* 245 cyls, 0-based */
+        uint32_t max_cyl = 767;                   /* 768 cyls, 0-based (24 MB) */
         uint16_t cx = (uint16_t)(((max_cyl & 0xFF) << 8)
                      | (((max_cyl >> 2) & 0xC0)) | (SPT & 0x3F));
         env->regs[R_ECX] = (env->regs[R_ECX] & ~(target_ulong)0xFFFF) | cx;
@@ -503,15 +503,15 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
                      * Fill the INT 41h fixed-disk parameter table (IVT[0x41] ->
                      * F000:EA93, in writable F-segment shadow).  POST left it
                      * all zeros, so IO.SYS reads geometry 0/0/0 and computes
-                     * garbage CHS -> crash.  Write the real CF geometry
-                     * (245 cyl x 2 heads x 32 sec/trk): FDPT[0..1]=cyls,
+                     * garbage CHS -> crash.  Write the CF geometry
+                     * (768 cyl x 2 heads x 32 sec/trk = 24 MB): FDPT[0..1]=cyls,
                      * [2]=heads, [0xE]=spt. */
                     {
                         static const uint8_t fdpt[16] = {
-                            0xF5, 0x00,       /* cylinders = 245 */
+                            0x00, 0x03,       /* cylinders = 768 */
                             0x02,             /* heads = 2 */
                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                            0xF5, 0x00,       /* landing zone = 245 */
+                            0x00, 0x03,       /* landing zone = 768 */
                             0x20,             /* sectors/track = 32 */
                             0x00,
                         };
