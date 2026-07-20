@@ -99,7 +99,11 @@ Quit with Ctrl+Cmd+Q.
 ## Booting the real BIOS (experimental)
 
 `scripts/run-realbios.sh` boots the genuine 256 KiB PC110 BIOS on QEMU instead
-of SeaBIOS. This is a work in progress, but it now gets a long way:
+of SeaBIOS. This is a work in progress, but it now gets a long way. (No
+screenshot yet: the boot drives the Chips & Technologies F65535 flat-panel VGA,
+whose mode-set QEMU's stock `-vga std` doesn't model, so nothing renders
+on-screen even though POST and DOS are running underneath — progress is
+observed via the instruction trace / `PC110RSTLOG`.)
 
 - **POST completes** — memory sizing, chipset self-tests, the timer/refresh
   calibration, the Chips & Technologies flat-panel VGA BIOS (video mode set),
