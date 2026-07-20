@@ -16,10 +16,10 @@ obtained dumps (see [`roms/`](roms/README.md) and [`disks/`](disks/README.md)).
 - **Personaware** boots to its full pen-driven launcher (Schedule, ToDo,
   Notebook, Address, E-Mail, FAX, Telephone, IR Connect, World Clock,
   Calculator, Editor, Draw Memo, Game, Personal, DOS, Power MGT) with sharp
-  kanji drawn straight from the PC110 font ROM. The disk is formatted with 2 KB
-  clusters (the PC110's native layout) so Personaware boots straight to a clean
-  launcher — a disk with tiny 512-byte clusters makes too many clusters and
-  trips a bogus "low disk space" dialog (see [`disks/`](disks/README.md)).
+  kanji drawn straight from the PC110 font ROM. The disk is a 4 MB FAT12 image
+  (matching the real unit's internal storage) so Personaware boots straight to a
+  clean launcher — a disk with 512-byte clusters trips a bogus "low disk space"
+  dialog regardless of how much is free (see [`disks/`](disks/README.md)).
 - **Easy-Setup** (the real graphical F1 BIOS setup: Config / Date-Time /
   Password / Start up / Test / Restart) runs under SeaBIOS and renders from the
   genuine BIOS ROM. Exiting it returns to normal Personaware mode.

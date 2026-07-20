@@ -15,26 +15,29 @@ own), you can use it directly as `Personaware-disk.img` and skip `make-disk.py`.
 
 Personaware can pop a Japanese **"注意 … ディスクの残りが少なく"** ("Caution: disk
 space is running low") dialog at startup. It looks like a free-space warning, but
-it is **not** about free space or disk size — it is triggered by the **FAT16
-cluster size**:
+it is **not** about free space or disk size — it is triggered by the **FAT
+cluster size** (verified across two disk sizes):
 
-| Disk | Cluster size | Total clusters | Free | Dialog |
+| Disk | Cluster size | FS | Free | Dialog |
 | --- | --- | --- | --- | --- |
-| CF dump (as pulled off an 8 MB CF) | 512 B | ~15,500 | 4.5 MB | **yes** |
-| Same disk, reformatted | 2 KB | ~3,900 | 4.6 MB | **no** |
+| 8 MB CF dump | 512 B | FAT16 | 4.5 MB | **yes** |
+| 8 MB, reformatted | 2 KB | FAT16 | 4.6 MB | **no** |
+| 4 MB, 512 B clusters | 512 B | FAT16 | 0.9 MB | **yes** |
+| **4 MB, 1 KB clusters** ← shipped | 1 KB | FAT12 | 0.9 MB | **no** |
 
-Same size, same free space — only the cluster size differs. The real PC110's
-4 MB internal storage uses large clusters (few clusters) and never shows the
-dialog; copying it onto a CF reformats it with 512-byte clusters, producing
-~15,500 clusters, which Personaware's disk-space code mishandles and reports as
-"low space." **Fix: format the disk with ≥2 KB clusters** (`mformat … -c 4`),
-which matches the machine's native layout — no need to change the disk size.
+512-byte clusters trip the dialog at *both* sizes (even the 4 MB disk with only
+0.9 MB free); ≥1 KB clusters clear it regardless of size or free space. The real
+PC110's 4 MB internal storage is FAT12 with large clusters, so it never warns —
+but when you dump it onto a CF, the CF is FAT16 with 512-byte clusters (~15,500
+clusters), which Personaware's disk-space code mishandles and reports as "low
+space."
 
-The image shipped here is the original ~8 MB size, reformatted with 2 KB
-clusters. When rebuilding, copy the IBM PC-DOS system files (`IBMBIO.COM`,
-`IBMDOS.COM`, `COMMAND.COM`) **first** so they stay the first root-directory
-entries (the boot sector requires `IBMBIO.COM` at slot 0), and keep the original
-MBR boot code + boot-sector loader with the new BPB.
+The image shipped here matches the real machine: a **4 MB FAT12 volume with
+1 KB clusters**. To rebuild one: `mformat … -c 2` on a 4 MB (128 cyl × 2 × 32)
+partition, patch the BPB geometry back to 32 sectors/track (mtools rewrites it),
+splice the IBM PC-DOS boot loader onto the fresh BPB, and copy the system files
+(`IBMBIO.COM`, `IBMDOS.COM`, `COMMAND.COM`) **first** so `IBMBIO.COM` stays root
+slot 0 (the boot sector requires it there).
 
 ## CONFIG.SYS tweak for QEMU
 
