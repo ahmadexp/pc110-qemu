@@ -80,6 +80,19 @@ struct PC110ChipsetState {
     uint8_t scamp_index;
     uint8_t scamp_regs[128];
 
+    /* VL82C420 "block2" config window 0x24(index)/0x25(data): the POST/init
+     * programming view (256 regs), seeded from a real-hardware dump.  Key:
+     * block2[0xB8] bit3 = resume-from-suspend strap (0 = cold boot); leaving it
+     * unmapped read 0xFF => bit3 set => the BIOS/driver takes the resume path. */
+    uint8_t block2_index;
+    uint8_t block2_regs[256];
+
+    /* VL82C420 clock-stop / config-lock ports (STPCLK power path, chipset ref
+     * 13j.8/13j.9): 0x22/0x23 config-lock, 0x302 & 0x704 clock-stop bits. */
+    uint16_t reg22;
+    uint16_t reg302;
+    uint16_t reg704;
+
     /* power MCU 0xEC/0xED */
     uint8_t mcu_index;
     uint8_t mcu_regs[256];
@@ -114,6 +127,10 @@ struct PC110ChipsetState {
     MemoryRegion io_35ea;
     MemoryRegion io_3e0;
     MemoryRegion io_3f0;
+    MemoryRegion io_24;
+    MemoryRegion io_22;
+    MemoryRegion io_302;
+    MemoryRegion io_704;
 };
 
 /*
@@ -432,6 +449,64 @@ static const MemoryRegionOps eram_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* ---- 0x24/0x25 VL82C420 "block2" config window (index/data) ----
+ * The POST/init programming view of the chipset config (256 8-bit regs).  The
+ * real four-read unlock gate (in FC23/F023/C023/0023) is not required here: we
+ * always serve the seeded values, which is what the unlocked window returns.
+ * Seeded from a real-hardware dump (Open-Source-PC110 block2_config.txt); the
+ * load-bearing byte is block2[0xB8]=0x00 (bit3 clear => cold boot, not
+ * resume-from-suspend). */
+static uint64_t block2_read(void *o, hwaddr a, unsigned sz)
+{
+    PC110ChipsetState *s = o;
+    if (a == 0) {                 /* 0x24 index */
+        return s->block2_index;
+    }
+    if (getenv("PC110RSTLOG")) {
+        static int n;
+        if (n++ < 24) {
+            fprintf(stderr, "[pc110chip] block2[%02X] read -> %02X\n",
+                    s->block2_index, s->block2_regs[s->block2_index]);
+        }
+    }
+    return s->block2_regs[s->block2_index];   /* 0x25 data */
+}
+static void block2_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{
+    PC110ChipsetState *s = o;
+    if (a == 0) {                 /* 0x24 index */
+        s->block2_index = (uint8_t)v;
+    } else {                      /* 0x25 data */
+        s->block2_regs[s->block2_index] = (uint8_t)v;
+    }
+}
+static const MemoryRegionOps block2_ops = {
+    .read = block2_read, .write = block2_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 1,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* ---- 0x22/0x23, 0x302, 0x704 clock-stop / config-lock (STPCLK path) ----
+ * Modeled as plain 16-bit R/W latches so the BIOS/driver read-modify-write and
+ * config-lock/clock-stop sequences see real values instead of an unmapped
+ * 0xFFFF (which corrupts the RMW result).  We do NOT actually stop the clock. */
+/* Per-port wrappers (each region is 2 bytes wide, little-endian). */
+static uint64_t clk22_read(void *o, hwaddr a, unsigned sz)
+{ PC110ChipsetState *s = o; return (s->reg22 >> (a * 8)) & ((sz == 1) ? 0xFF : 0xFFFF); }
+static void clk22_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{ PC110ChipsetState *s = o; if (sz == 1) { if (a) s->reg22 = (s->reg22 & 0x00FF) | ((v & 0xFF) << 8); else s->reg22 = (s->reg22 & 0xFF00) | (v & 0xFF); } else s->reg22 = v; }
+static uint64_t clk302_read(void *o, hwaddr a, unsigned sz)
+{ PC110ChipsetState *s = o; return (s->reg302 >> (a * 8)) & ((sz == 1) ? 0xFF : 0xFFFF); }
+static void clk302_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{ PC110ChipsetState *s = o; if (sz == 1) { if (a) s->reg302 = (s->reg302 & 0x00FF) | ((v & 0xFF) << 8); else s->reg302 = (s->reg302 & 0xFF00) | (v & 0xFF); } else s->reg302 = v; }
+static uint64_t clk704_read(void *o, hwaddr a, unsigned sz)
+{ PC110ChipsetState *s = o; return (s->reg704 >> (a * 8)) & ((sz == 1) ? 0xFF : 0xFFFF); }
+static void clk704_write(void *o, hwaddr a, uint64_t v, unsigned sz)
+{ PC110ChipsetState *s = o; if (sz == 1) { if (a) s->reg704 = (s->reg704 & 0x00FF) | ((v & 0xFF) << 8); else s->reg704 = (s->reg704 & 0xFF00) | (v & 0xFF); } else s->reg704 = v; }
+static const MemoryRegionOps clk22_ops  = { .read = clk22_read,  .write = clk22_write,  .valid.min_access_size = 1, .valid.max_access_size = 2, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps clk302_ops = { .read = clk302_read, .write = clk302_write, .valid.min_access_size = 1, .valid.max_access_size = 2, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps clk704_ops = { .read = clk704_read, .write = clk704_write, .valid.min_access_size = 1, .valid.max_access_size = 2, .endianness = DEVICE_LITTLE_ENDIAN };
+
 static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
 {
     ISADevice *isadev = ISA_DEVICE(d);
@@ -512,10 +587,32 @@ static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
             0xff,0xff,0xff,0xe8,0x35,0x04,0xff,0xff,
             0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
         };
+        /* VL82C420 block2 (0x24/0x25) live dump — Open-Source-PC110
+         * block2_config.txt (four-read-unlock capture, 2026-07-20).  block2[0xB8]
+         * = 0x00 (bit3 clear => cold boot) is the load-bearing value. */
+        static const uint8_t block2_seed[0x100] = {
+            0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0x40,0x41,0x42,0x43,0xFF,0xFF,0x00,0x0F,
+            0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0xFF,0xFF,0x11,0x08,0x04,0x01,0x00,0x20,0x0B,0x0C,0x00,0x08,0xFF,0xFF,0x80,0xFF,
+            0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0x00,0x00,0x12,0x00,0x50,0x05,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0xFF,
+            0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0x00,0x01,0x00,0xFF,0xFF,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0x02,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0xFF,0xFF,0xFF,0xFF,0xEE,0x15,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xC0,0x41,0x42,0x43,0xAA,0xAA,0x00,0x0E,
+            0xFF,0xFF,0x11,0x70,0x02,0x01,0x00,0x20,0x0B,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0xBA,0x9E,0xF0,0x5A,0x50,0xF5,0xDA,0x00,0x00,0x40,0x00,0x00,0x02,0xFF,0x10,0x14,
+            0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xF2,0x03,0xA1,0x02,0xFF,0xFF,0xFF,0xFF,
+            0x60,0x00,0x24,0x00,0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x20,0x00,0xFF,0xFF,0xFF,0xFF,
+            0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xF4,0x03,0xA1,0x02,0xFF,0xFF,0xFF,0xFF,
+            0x80,0x00,0x00,0x00,0x10,0x20,0x08,0x07,0x0E,0xFF,0xFF,0x18,0xE0,0xFF,0x3F,0x00,
+        };
         memcpy(s->scamp_regs, scamp_seed, sizeof(scamp_seed));
         memcpy(s->mcu_regs, mcu_seed, sizeof(mcu_seed));
         memcpy(s->cmos, cmos_seed, sizeof(cmos_seed));
         memcpy(s->ext35_regs, ext35_seed, sizeof(ext35_seed));
+        memcpy(s->block2_regs, block2_seed, sizeof(block2_seed));
     }
 
     /* 0x80-0x8F: override QEMU's partial DMA page decode with full R/W scratch */
@@ -554,6 +651,21 @@ static void pc110_chipset_realizefn(DeviceState *d, Error **errp)
     /* 0x3F0/0x3F1 SCAMP-style window (override default FDC decode at 0x3F0) */
     memory_region_init_io(&s->io_3f0, OBJECT(d), &fdcw_ops, s, "pc110-fdcw", 2);
     memory_region_add_subregion_overlap(io, 0x3F0, &s->io_3f0, 10);
+
+    /* 0x24/0x25 VL82C420 block2 config window (POST/init programming view) */
+    memory_region_init_io(&s->io_24, OBJECT(d), &block2_ops, s, "pc110-block2", 2);
+    memory_region_add_subregion_overlap(io, 0x24, &s->io_24, 10);
+
+    /* clock-stop / config-lock latches (STPCLK power path) */
+    memory_region_init_io(&s->io_22, OBJECT(d), &clk22_ops, s, "pc110-clk22", 2);
+    memory_region_add_subregion_overlap(io, 0x22, &s->io_22, 10);
+    memory_region_init_io(&s->io_302, OBJECT(d), &clk302_ops, s, "pc110-clk302", 2);
+    memory_region_add_subregion_overlap(io, 0x302, &s->io_302, 10);
+    memory_region_init_io(&s->io_704, OBJECT(d), &clk704_ops, s, "pc110-clk704", 2);
+    memory_region_add_subregion_overlap(io, 0x704, &s->io_704, 10);
+    s->reg22 = 0x0100;   /* config-lock bit8 set (locked) at rest */
+    s->reg302 = 0x0000;
+    s->reg704 = 0x0000;
 
     /* optional full-ROM overlay at 0xC0000-0xFFFFF */
     if (s->biosfile) {

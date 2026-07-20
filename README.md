@@ -108,10 +108,21 @@ of SeaBIOS. This is a work in progress, but it now gets a long way:
   and services disk I/O out of the disk image, and the MS-DOS 7 kernel plus the
   `CONFIG.SYS` driver stack (HIMEM, EMM386, the RIOS `$FONT`/`$DISP`/`$IAS`
   drivers) load and run.
-- **Not yet: the Personaware desktop.** During driver init a RIOS PC110 driver
-  takes a code path that dives into a BIOS extension and ends in a POST
-  re-entry, which the reference emulator's path avoids. This is a long tail of
-  small chipset/BIOS-fidelity gaps rather than one missing feature.
+- **Not yet: the Personaware desktop.** The terminal blocker is the PC110
+  **power-management / suspend-resume path**: the RIOS `POWER.EXE ADV:MAX`
+  driver programs the VL82C420 self-refresh/clock-stop registers and takes the
+  286-era KBC-`0xFE` reset expecting a *suspend → resume*, which QEMU does not
+  yet model (it warm-re-POSTs instead of resuming). Reaching the desktop needs
+  that subsystem, on top of the config-window fidelity below.
+
+The `pc110-chipset` device now models the VL82C420's config windows against the
+live-hardware register maps in the **Open-Source-PC110** project's
+[`Discovery/Chipset`](https://github.com/ahmadexp/Open-Source-PC110/tree/main/Discovery/Chipset):
+the SCAMP window (`0x74/0x76`), the **block2** POST/init window (`0x24/0x25`,
+seeded from the live dump — incl. the DRAM-timing and SMI I/O-trap descriptors),
+and the clock-stop / config-lock latches (`0x22/0x23`, `0x302`, `0x704`). The
+EC/ED shadow/cache/ROM-decode window and the full suspend/resume path are the
+remaining pieces.
 
 How it works (`qemu/target-i386/pc110post.c`, applied via `qemu/patches/`):
 
