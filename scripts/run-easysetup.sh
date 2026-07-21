@@ -23,5 +23,6 @@ exec "$QEMU" \
   -drive file="$ROOT/disks/Personaware-disk.img",format=raw,index=0,media=disk \
   -boot order=c,once=a \
   -vga cirrus \
+  -audiodev "${PC110_AUDIODEV:-coreaudio},id=snd0" -machine pcspk-audiodev=snd0 \
   -device pc110-fontrom,romfile="$ROOT/roms/pc110-fontrom.bin" \
   -display cocoa,zoom-to-fit=on

@@ -34,6 +34,10 @@ FONT="$ROOT/roms/pc110-fontrom.bin"
 # The Personaware CF image is 8192 sectors = 128 cyl x 2 heads x 32 secs (4 MB,
 # partition at LBA 32); present that geometry explicitly so the software INT13
 # service and the boot chain agree.  QEMU_COCOA_SCALE: see run-personaware.sh.
+# Audio: the PC110's sound is the PC speaker (PIT ch2 gated by port 0x61), just
+# like the reference emulator.  Wire QEMU's built-in PC speaker to a host audio
+# backend so beeps are audible.  Default to CoreAudio (macOS); set PC110_AUDIODEV
+# (e.g. pa / pipewire / alsa) on other hosts, or =none to mute.
 exec env PC110POST=1 PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" \
   "$QEMU" \
   -m 4 -cpu 486 \
@@ -41,6 +45,7 @@ exec env PC110POST=1 PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}"
   -drive id=hd0,file="$DISK",format=raw,if=none,snapshot=on \
   -device ide-hd,drive=hd0,bus=ide.0,unit=0,cyls=128,heads=2,secs=32 \
   -boot c -vga std \
+  -audiodev "${PC110_AUDIODEV:-coreaudio},id=snd0" -machine pcspk-audiodev=snd0 \
   -device "pc110-chipset,biosfile=$BIOS,vgac000=on" \
   -device pc110-fontrom,romfile="$FONT" \
   -display cocoa,zoom-to-fit=on "$@"

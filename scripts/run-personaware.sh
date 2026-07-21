@@ -19,5 +19,6 @@ exec env QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" "$QEMU" \
   -boot c \
   -net nic,model=ne2k_isa \
   -vga cirrus \
+  -audiodev "${PC110_AUDIODEV:-coreaudio},id=snd0" -machine pcspk-audiodev=snd0 \
   -device pc110-fontrom,romfile="$ROOT/roms/pc110-fontrom.bin" \
   -display cocoa,zoom-to-fit=on

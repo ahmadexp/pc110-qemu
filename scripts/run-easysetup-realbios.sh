@@ -35,6 +35,7 @@ exec env PC110POST=1 PC110SETUP=1 PC110SETUPIMG="$ESIMG" PC110BOOT="$DISK" \
   -drive id=hd0,file="$DISK",format=raw,if=none,snapshot=on \
   -device ide-hd,drive=hd0,bus=ide.0,unit=0,cyls=128,heads=2,secs=32 \
   -boot c -vga std \
+  -audiodev "${PC110_AUDIODEV:-coreaudio},id=snd0" -machine pcspk-audiodev=snd0 \
   -device "pc110-chipset,biosfile=$BIOS,vgac000=on" \
   -device pc110-fontrom,romfile="$FONT" \
   -display cocoa,zoom-to-fit=on "$@"
