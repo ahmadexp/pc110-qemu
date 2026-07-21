@@ -27,10 +27,14 @@ FONT="$ROOT/roms/pc110-fontrom.bin"
 ESIMG="${PC110SETUPIMG:-$ROOT/boot/easysetup.bin}"
 [ -f "$ESIMG" ] || { echo "error: missing $ESIMG -- run boot/build-floppy.sh first"; exit 1; }
 
+# Pace the CPU to the PC110's real ~33 MHz 486 (shift=5 ~= 31 MHz, nearest power of
+# two); override with PC110_ICOUNT, or set it empty to run at full host speed.
+ICOUNT="${PC110_ICOUNT-shift=5}"
+ICOUNT_ARG=""; [ -n "$ICOUNT" ] && ICOUNT_ARG="-icount $ICOUNT"
 exec env PC110POST=1 PC110SETUP=1 PC110SETUPIMG="$ESIMG" PC110BOOT="$DISK" \
   QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" \
   "$QEMU" \
-  -m 4 -cpu 486 \
+  -m 4 -cpu 486 $ICOUNT_ARG \
   -bios "$BIOS" \
   -drive id=hd0,file="$DISK",format=raw,if=none,snapshot=on \
   -device ide-hd,drive=hd0,bus=ide.0,unit=0,cyls=128,heads=2,secs=32 \

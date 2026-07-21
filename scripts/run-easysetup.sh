@@ -16,8 +16,12 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 QEMU="$ROOT/qemu-src/build/qemu-system-i386"
 
+# Pace the CPU to the PC110's real ~33 MHz 486 (shift=5 ~= 31 MHz, nearest power of
+# two); override with PC110_ICOUNT, or set it empty to run at full host speed.
+ICOUNT="${PC110_ICOUNT-shift=5}"
+ICOUNT_ARG=""; [ -n "$ICOUNT" ] && ICOUNT_ARG="-icount $ICOUNT"
 exec "$QEMU" \
-  -m 20M -cpu 486 \
+  -m 20M -cpu 486 $ICOUNT_ARG \
   -bios "$ROOT/qemu-src/pc-bios/bios.bin" \
   -fda "$ROOT/disks/easysetup-floppy.img" \
   -drive file="$ROOT/disks/Personaware-disk.img",format=raw,index=0,media=disk \
