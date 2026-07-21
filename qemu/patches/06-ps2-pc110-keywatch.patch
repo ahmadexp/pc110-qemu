@@ -1,0 +1,11 @@
+--- a/hw/input/ps2.c	2026-07-21 12:04:15.802323902 -0700
++++ b/hw/input/ps2.c	2026-07-21 11:55:19.368685527 -0700
+@@ -291,6 +291,8 @@
+ {
+     PS2KbdState *s = opaque;
+     PS2State *ps = PS2_DEVICE(s);
++    extern int pc110_key_pressed;   /* PC110: note a real user keypress */
++    pc110_key_pressed = 1;
+ 
+     trace_ps2_put_keycode(opaque, keycode);
+     qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);

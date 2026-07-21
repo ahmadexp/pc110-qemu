@@ -247,6 +247,9 @@ static void pc110_int13(CPUX86State *env)
 
 int pc110_booted; /* set once INT19 has software-booted the disk (read by the
                    * chipset: the E-segment becomes a writable DOS UMB post-boot) */
+int pc110_key_pressed; /* set by hw/input/ps2.c on any real user keypress; used to
+                        * tell an intentional Easy-Setup Restart (user pressed keys
+                        * then rebooted) from a spurious CPU reset (no interaction) */
 /* Set by hw/input/pckbd.c when a KBC 0xFE (or output-port reset-line) command is
  * issued in PC110POST mode, INSTEAD of QEMU's async full-machine reset (which
  * wipes RAM).  Consumed here at the next TB boundary as a synchronous CPU-only
@@ -713,17 +716,24 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
          * is F000:3391 (the F1 scancode branch from F000:3273); our POST
          * completer bypasses the keyboard dispatch, so jump there directly at
          * the boot decision point. */
-        /* Enter Easy-Setup ONLY on the first boot decision, exactly like
-         * pressing F1 once on real hardware.  A later F000:52BD (e.g. Easy-
-         * Setup's Restart, which triggers a full re-POST) must fall through to
-         * the normal disk boot below so the machine boots Personaware -- that is
-         * how the user "exits" Easy-Setup.  `entered` gates this: hit #1 enters
-         * Setup, hit #2+ boots the disk.  (An earlier build made this sticky to
-         * dodge a rare cocoa spurious-reset flip, but that broke Exit/Restart;
-         * booting the disk on re-entry is the correct, user-visible behavior.) */
+        /* Enter Easy-Setup at the boot decision, and re-enter it on a re-POST
+         * UNLESS the user actually interacted with it first.  This distinguishes
+         * the two ways a second F000:52BD happens: a *spurious* CPU reset (seen
+         * intermittently under the real-time cocoa display, with NO user input)
+         * must re-enter Easy-Setup so the screen never flips to the Personaware
+         * disk boot; an *intentional* Restart (the user navigated with the keys
+         * and chose Restart) must fall through to the disk boot -> Personaware.
+         * pc110_key_pressed (set by the PS/2 keyboard on any real keypress, and
+         * cleared each time we (re-)enter Setup) is the discriminator: no key
+         * since entry => spurious => re-enter; a key since entry => the user did
+         * something, so a following re-POST is a real Restart => boot the disk.
+         * Deterministic first launch, working Exit/Restart, no cocoa flip. */
         if (!pc110_booted && getenv("PC110SETUP")) {
             static int entered;
-            if (!entered++) {
+            int intentional_restart = (entered && pc110_key_pressed);
+            if (!intentional_restart) {
+                entered = 1;
+                pc110_key_pressed = 0;   /* watch for interaction this session */
                 const char *img = getenv("PC110SETUPIMG");
                 if (img && img[0]) {
                     /* Authentic F1 outcome, robust entry: load the Easy-Setup
