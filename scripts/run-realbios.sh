@@ -30,6 +30,7 @@ QEMU="$ROOT/qemu-src/build/qemu-system-i386"
 BIOS="$ROOT/roms/pc110_bios.bin"
 DISK="$ROOT/disks/Personaware-disk.img"
 FONT="$ROOT/roms/pc110-fontrom.bin"
+ESIMG="${PC110SETUPIMG:-$ROOT/boot/easysetup.bin}"   # for the in-POST F1 -> Easy-Setup
 
 # The Personaware CF image is 8192 sectors = 128 cyl x 2 heads x 32 secs (4 MB,
 # partition at LBA 32); present that geometry explicitly so the software INT13
@@ -38,7 +39,15 @@ FONT="$ROOT/roms/pc110-fontrom.bin"
 # like the reference emulator.  Wire QEMU's built-in PC speaker to a host audio
 # backend so beeps are audible.  Default to CoreAudio (macOS); set PC110_AUDIODEV
 # (e.g. pa / pipewire / alsa) on other hosts, or =none to mute.
-exec env PC110POST=1 PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" \
+# Realistic boot (on by default): show the genuine BIOS POST on screen (real POST
+# codes -> "Starting PC DOS..."), a power-on beep, and a "Press F1 for Easy-Setup"
+# prompt.  Press F1 promptly (the emulated POST reaches its boot decision in about
+# a second) to enter Easy-Setup; otherwise Personaware boots.  Run with
+# PC110POSTUI=0 to disable it and boot straight to Personaware.
+POSTUI_ENV=""
+[ "${PC110POSTUI-1}" != 0 ] && POSTUI_ENV="PC110POSTUI=1"
+exec env PC110POST=1 $POSTUI_ENV PC110SETUPIMG="$ESIMG" \
+  PC110BOOT="$DISK" QEMU_COCOA_SCALE="${QEMU_COCOA_SCALE:-2}" \
   "$QEMU" \
   -m 4 -cpu 486 \
   -bios "$BIOS" \

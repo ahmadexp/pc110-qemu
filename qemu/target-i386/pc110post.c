@@ -17,6 +17,7 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/cpu-common.h"
+#include "system/ioport.h"   /* cpu_outb: PC-speaker beep during the F1 window */
 
 /* cpu_reset() lives in hw/core; declare it here to avoid pulling hw headers
  * into this target file. */
@@ -250,6 +251,53 @@ int pc110_booted; /* set once INT19 has software-booted the disk (read by the
 int pc110_key_pressed; /* set by hw/input/ps2.c on any real user keypress; used to
                         * tell an intentional Easy-Setup Restart (user pressed keys
                         * then rebooted) from a spurious CPU reset (no interaction) */
+
+/* Realistic-boot (PC110POSTUI) state: show the genuine POST on the VGA with a short
+ * beep and a "Press F1 for Easy-Setup" prompt; F1 during the POST enters Easy-Setup,
+ * else the disk boots.  All reset to a fresh POST when g_reset_count changes. */
+static int rb_gen = -1;   /* g_reset_count of the POST these fields belong to */
+static int rb_modeset;    /* text mode 3 forced (POST made visible) this POST */
+static uint32_t rb_saved_eax;
+static int rb_ticks;      /* POST teletype chars counted (to end the short beep) */
+
+/* Load the extracted Easy-Setup program to 0x50000 and enter it at its genuine
+ * entry 5000:0000 (with the palette-theme alias fix), or fall back to the ROM
+ * entry F000:3391.  Shared by the PC110SETUP force and the PC110POSTUI F1 choice. */
+static bool pc110_enter_easysetup(CPUX86State *env)
+{
+    const char *img = getenv("PC110SETUPIMG");
+    if (img && img[0]) {
+        FILE *sf = fopen(img, "rb");
+        if (sf) {
+            static uint8_t sbuf[300000];
+            size_t n = fread(sbuf, 1, sizeof(sbuf), sf);
+            fclose(sf);
+            cpu_physical_memory_write(0x00050000, sbuf, n);
+            if (!getenv("PC110NOPALFIX")) {
+                uint8_t rose9[9];
+                cpu_physical_memory_read(0x00050000 + 0xBCFF, rose9, sizeof(rose9));
+                cpu_physical_memory_write(0x00050000 + 0xBCF6, rose9, sizeof(rose9));
+            }
+            env->segs[R_CS].selector = 0x5000; env->segs[R_CS].base = 0x00050000;
+            env->segs[R_DS].selector = 0; env->segs[R_DS].base = 0;
+            env->segs[R_ES].selector = 0; env->segs[R_ES].base = 0;
+            env->segs[R_SS].selector = 0; env->segs[R_SS].base = 0;
+            env->regs[R_ESP] = 0x7000;
+            env->regs[R_EDX] = getenv("PC110SETUPHD") ? 0x80 : 0x00;
+            env->eip = 0;
+            if (getenv("PC110RSTLOG")) {
+                fprintf(stderr, "[pc110post] Easy-Setup: loaded %zu-byte image, "
+                        "entering 5000:0000\n", n);
+            }
+            return true;
+        }
+    }
+    if (getenv("PC110RSTLOG")) {
+        fprintf(stderr, "[pc110post] Easy-Setup: entering ROM @F000:3391\n");
+    }
+    env->eip = 0x3391;
+    return true;
+}
 /* Set by hw/input/pckbd.c when a KBC 0xFE (or output-port reset-line) command is
  * issued in PC110POST mode, INSTEAD of QEMU's async full-machine reset (which
  * wipes RAM).  Consumed here at the next TB boundary as a synchronous CPU-only
@@ -325,10 +373,12 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
         /* Easy-Setup reads the POST error log via INT 15h AH=21h AL=00h and shows
          * its ERROR screen (Test/Restart) whenever the log is non-empty.  Our
          * emulated POST logs spurious entries (the completer's reset/probe
-         * anomalies), so under PC110SETUP force an EMPTY log -- BH=0 (count),
-         * CF=0 -- so Easy-Setup opens the config menu instead.  Skip the real
-         * INT 15h (jump past it to the dispatcher's retf at 0x5F239). */
-        if (getenv("PC110SETUP") && ah == 0x21 && al == 0x00) {
+         * anomalies), so under PC110SETUP or the realistic-boot F1 path
+         * (PC110POSTUI) force an EMPTY log -- BH=0 (count), CF=0 -- so Easy-Setup
+         * opens the config menu instead.  Skip the real INT 15h (jump past it to
+         * the dispatcher's retf at 0x5F239). */
+        if ((getenv("PC110SETUP") || getenv("PC110POSTUI")) &&
+            ah == 0x21 && al == 0x00) {
             env->regs[R_EAX] &= 0xFFFF00FFu;         /* AH = 0 (status ok) */
             env->regs[R_EBX] &= 0xFFFF0000u;         /* BX = 0 (BH count = 0) */
             env->eflags &= ~0x1u;                    /* CF = 0 (success) */
@@ -424,6 +474,68 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
     cssel = (uint16_t)env->segs[R_CS].selector;
     (void)cssel;
     off = (uint16_t)(pc - csbase);
+
+    /* ================= Realistic boot (PC110POSTUI) =================
+     * Make the genuine BIOS POST visible, beep, and let a real F1 press during
+     * the (naturally ~2-3s) POST enter Easy-Setup instead of booting the disk:
+     *   (a) reset rb_* at the start of each POST (g_reset_count bump);
+     *   (b) at the first POST teletype (F000:542C) inject a genuine INT 10h
+     *       AX=0003 so -vga std is in 80x25 text and the POST renders (it is
+     *       invisible otherwise); return via sentinel F000:FF00;
+     *   (c) at FF00 (mode set done) paint the "Press F1" prompt and start a
+     *       short power-on beep, then resume the teletype;
+     *   (d) subsequent teletype chars count the short beep down.
+     * The F1 decision is taken in the F000:52BD handler below -- input flows
+     * because the POST is genuine guest execution, so a key pressed while the
+     * POST is on screen is seen there.  (A pause past 52BD can't work: it either
+     * starves host input under the BQL or hangs, so the window is the POST.) */
+    if (getenv("PC110POSTUI")) {
+        if (rb_gen != g_reset_count) {           /* (a) fresh POST */
+            rb_gen = g_reset_count;
+            rb_modeset = 0; rb_ticks = 0;
+        }
+        if (csbase == 0xF0000 && off == 0x542C) {
+            if (!rb_modeset) {                   /* (b) first teletype -> set text mode 3 */
+                rb_modeset = 1;
+                rb_saved_eax = env->regs[R_EAX];
+                uint32_t ssb = (uint32_t)env->segs[R_SS].base;
+                uint16_t sp = (uint16_t)(env->regs[R_ESP] & 0xFFFF);
+                uint16_t fl = (uint16_t)(cpu_compute_eflags(env) & 0xFFFF);
+                uint16_t cs = env->segs[R_CS].selector;
+                uint8_t b[2];
+                sp -= 2; b[0]=fl; b[1]=fl>>8;  cpu_physical_memory_write(ssb+sp, b, 2);
+                sp -= 2; b[0]=cs; b[1]=cs>>8;  cpu_physical_memory_write(ssb+sp, b, 2);
+                sp -= 2; b[0]=0x00; b[1]=0xFF; cpu_physical_memory_write(ssb+sp, b, 2);
+                env->regs[R_ESP] = (env->regs[R_ESP] & ~(target_ulong)0xFFFF) | sp;
+                env->regs[R_EAX] = 0x0003;
+                uint8_t v[4]; cpu_physical_memory_read(0x10u * 4u, v, 4);
+                uint16_t hip = v[0] | (v[1] << 8), hcs = v[2] | (v[3] << 8);
+                env->segs[R_CS].selector = hcs; env->segs[R_CS].base = (uint32_t)hcs << 4;
+                env->eip = hip;
+                return true;
+            }
+            if (++rb_ticks == 12) {              /* (d) end the short beep */
+                cpu_outb(0x61, (uint8_t)(cpu_inb(0x61) & ~3));
+            }
+            return false;
+        }
+        if (csbase == 0xF0000 && off == 0xFF00) {   /* (c) mode set done */
+            env->regs[R_EAX] = rb_saved_eax;
+            static const char msg[] = "  Press F1 for Easy-Setup";
+            uint32_t vbase = 0xB8000 + 24u * 80u * 2u;   /* bottom row */
+            for (int i = 0; msg[i]; i++) {
+                uint8_t cell[2] = { (uint8_t)msg[i], 0x0F };
+                cpu_physical_memory_write(vbase + (uint32_t)i * 2u, cell, 2);
+            }
+            cpu_outb(0x43, 0xB6);                        /* PIT ch2 square wave */
+            cpu_outb(0x42, (uint8_t)(1331 & 0xFF));
+            cpu_outb(0x42, (uint8_t)((1331 >> 8) & 0xFF));
+            cpu_outb(0x61, (uint8_t)(cpu_inb(0x61) | 3)); /* short beep on */
+            env->segs[R_CS].selector = 0xF000; env->segs[R_CS].base = 0xF0000;
+            env->eip = 0x542C;
+            return true;
+        }
+    }
 
     uint16_t prev_off = g_prev_off; /* previous F-seg TB offset (reset-caller diag) */
     g_prev_off = off;
@@ -703,6 +815,16 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
         return true;
     }
 
+
+    /* Realistic boot (PC110POSTUI): at the boot decision, if F1 was pressed
+     * while the POST was on screen, enter Easy-Setup; otherwise boot the disk. */
+    if (getenv("PC110POSTUI") && csbase == 0xF0000 && off == 0x52BD && !pc110_booted) {
+        cpu_outb(0x61, (uint8_t)(cpu_inb(0x61) & ~3));   /* ensure the beep is off */
+        if (pc110_key_pressed) {                          /* F1 during POST -> Easy-Setup */
+            return pc110_enter_easysetup(env);
+        }
+        /* else fall through to the normal disk boot below */
+    }
 
     if (csbase == 0xF0000 && off == 0x52BD) {
         if (getenv("PC110RSTLOG")) {
