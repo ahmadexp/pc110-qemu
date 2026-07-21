@@ -713,9 +713,16 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
          * is F000:3391 (the F1 scancode branch from F000:3273); our POST
          * completer bypasses the keyboard dispatch, so jump there directly at
          * the boot decision point. */
-        if (!pc110_booted && getenv("PC110SETUP")) {
-            static int once;
-            if (!once++) {
+        /* STICKY: fire on EVERY pass through the boot decision while PC110SETUP
+         * is set -- including any re-POST from a spurious CPU reset -- so the
+         * display can never fall through to the Personaware disk boot.  The old
+         * `static int once` guard only held Easy-Setup until the first re-POST:
+         * a reset-induced second F000:52BD hit found `once` spent and dropped to
+         * INT19, booting Personaware (seen under the real-time cocoa display).
+         * Re-entering Easy-Setup is always safe -- entry at 5000:0000 is stable
+         * and idempotent (headless holds it 30s+ across the reset probes). */
+        if (getenv("PC110SETUP")) {
+            {   /* block retained to scope img/sf/n */
                 const char *img = getenv("PC110SETUPIMG");
                 if (img && img[0]) {
                     /* Authentic F1 outcome, robust entry: load the Easy-Setup
