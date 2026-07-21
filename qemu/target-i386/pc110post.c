@@ -17,7 +17,6 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/cpu-common.h"
-#include "system/ioport.h"
 
 /* cpu_reset() lives in hw/core; declare it here to avoid pulling hw headers
  * into this target file. */
@@ -248,33 +247,6 @@ static void pc110_int13(CPUX86State *env)
 
 int pc110_booted; /* set once INT19 has software-booted the disk (read by the
                    * chipset: the E-segment becomes a writable DOS UMB post-boot) */
-static int pc110_setup_active; /* set once Easy-Setup (PC110SETUP) has been entered */
-
-/* Correct 64-entry VGA DAC palette for Easy-Setup's main menu (6-bit RGB triples,
- * indices 0..63), captured from the ROM's own Easy-Setup after it has loaded its
- * palette.  The extracted program's FIRST main-menu draw comes up with a wrong
- * ("blue-ish") palette -- entering any panel reloads the correct one, which is
- * why the colors "correct" after navigating.  Because we enter the program
- * directly at 5000:0000 (bypassing the ROM's pre-entry palette setup), we
- * re-apply this palette shortly after entry so the first main menu is right. */
-static const uint8_t pc110_es_palette[192] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x2a, 0x00, 0x00, 0x2a, 0x2a,
-    0x2a, 0x00, 0x00, 0x2a, 0x00, 0x2a, 0x2f, 0x27, 0x25, 0x2a, 0x2a, 0x2a,
-    0x1c, 0x02, 0x08, 0x05, 0x00, 0x14, 0x21, 0x3f, 0x3f, 0x00, 0x0c, 0x13,
-    0x00, 0x00, 0x00, 0x2a, 0x00, 0x3f, 0x2a, 0x2a, 0x15, 0x2a, 0x2a, 0x3f,
-    0x00, 0x15, 0x00, 0x00, 0x15, 0x2a, 0x00, 0x3f, 0x00, 0x00, 0x3f, 0x2a,
-    0x2a, 0x15, 0x00, 0x2a, 0x15, 0x2a, 0x2a, 0x3f, 0x00, 0x2a, 0x3f, 0x2a,
-    0x00, 0x15, 0x15, 0x00, 0x15, 0x3f, 0x00, 0x3f, 0x15, 0x00, 0x3f, 0x3f,
-    0x2a, 0x15, 0x15, 0x2a, 0x15, 0x3f, 0x2a, 0x3f, 0x15, 0x2a, 0x3f, 0x3f,
-    0x15, 0x00, 0x00, 0x15, 0x00, 0x2a, 0x15, 0x2a, 0x00, 0x15, 0x2a, 0x2a,
-    0x3f, 0x00, 0x00, 0x3f, 0x00, 0x2a, 0x3f, 0x2a, 0x00, 0x3f, 0x2a, 0x2a,
-    0x15, 0x00, 0x15, 0x15, 0x00, 0x3f, 0x15, 0x2a, 0x15, 0x15, 0x2a, 0x3f,
-    0x3f, 0x00, 0x15, 0x3f, 0x00, 0x3f, 0x3f, 0x2a, 0x15, 0x3f, 0x2a, 0x3f,
-    0x15, 0x15, 0x00, 0x15, 0x15, 0x2a, 0x15, 0x3f, 0x00, 0x15, 0x3f, 0x2a,
-    0x3f, 0x15, 0x00, 0x3f, 0x15, 0x2a, 0x3f, 0x3f, 0x00, 0x3f, 0x3f, 0x2a,
-    0x15, 0x15, 0x15, 0x15, 0x15, 0x3f, 0x15, 0x3f, 0x15, 0x15, 0x3f, 0x3f,
-    0x3f, 0x15, 0x15, 0x3f, 0x15, 0x3f, 0x3f, 0x3f, 0x15, 0x3f, 0x3f, 0x3f,
-};
 /* Set by hw/input/pckbd.c when a KBC 0xFE (or output-port reset-line) command is
  * issued in PC110POST mode, INSTEAD of QEMU's async full-machine reset (which
  * wipes RAM).  Consumed here at the next TB boundary as a synchronous CPU-only
@@ -304,47 +276,6 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
     }
     if (!pc110post_enabled) {
         return false;
-    }
-
-    /* Bug fix: re-apply Easy-Setup's correct main-menu palette shortly after
-     * entry (see pc110_es_palette above).  The initial draw comes up "blue-ish"
-     * because our direct 5000:0000 entry skips the ROM's pre-entry palette
-     * setup; navigating into any panel reloads the palette, which is why the
-     * colors self-correct.  We write the DAC once per second across a short
-     * window [2..5s] after entry: this reliably lands AFTER the program's own
-     * first (wrong) palette load regardless of boot timing, and once corrected
-     * it sticks because the idle main menu never rewrites the DAC.  The window
-     * closes well before the user could navigate, so panel-specific palettes
-     * (e.g. Date/Time) are untouched.  Disable with PC110NOPALFIX. */
-    if (pc110_setup_active && !getenv("PC110NOPALFIX")) {
-        static time_t t0; static int last_sec;
-        if (!t0) t0 = time(NULL);
-        long el = (long)(time(NULL) - t0);
-        if (el >= 2 && el <= 5 && (int)el != last_sec) {
-            last_sec = (int)el;
-            cpu_outb(0x3C8, 0);   /* DAC write index = 0 */
-            for (int i = 0; i < (int)sizeof(pc110_es_palette); i++) {
-                cpu_outb(0x3C9, pc110_es_palette[i]);
-            }
-        }
-    }
-
-    /* DEBUG (PC110PALDUMP=<seconds>): once, N seconds after Easy-Setup is
-     * entered, dump the 256-entry VGA DAC to stderr so the correct palette can
-     * be re-captured (navigate into a submenu and back to the main menu first). */
-    if (getenv("PC110PALDUMP") && pc110_setup_active) {
-        static time_t t0; static int dumped;
-        if (!t0) t0 = time(NULL);
-        if (!dumped && time(NULL) - t0 >= atoi(getenv("PC110PALDUMP"))) {
-            dumped = 1;
-            cpu_outb(0x3C7, 0);
-            fprintf(stderr, "[pc110post] DACDUMP256 {");
-            for (int i = 0; i < 256 * 3; i++) {
-                fprintf(stderr, "%s0x%02x,", (i % 12 == 0) ? "\n    " : "",
-                        cpu_inb(0x3C9));
-            }
-            fprintf(stderr, "\n};\n");
-        }
     }
 
     /* Track the previous TB's linear PC across ALL segments (diagnostic): lets
@@ -793,7 +724,6 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
         if (!pc110_booted && getenv("PC110SETUP")) {
             static int entered;
             if (!entered++) {
-                pc110_setup_active = 1;
                 const char *img = getenv("PC110SETUPIMG");
                 if (img && img[0]) {
                     /* Authentic F1 outcome, robust entry: load the Easy-Setup
@@ -808,6 +738,27 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
                         size_t n = fread(sbuf, 1, sizeof(sbuf), sf);
                         fclose(sf);
                         cpu_physical_memory_write(0x00050000, sbuf, n);
+                        /* Palette-theme fix (root cause of the "blue-ish first
+                         * draw"): Easy-Setup picks its menu palette from a color
+                         * theme -- a resolver (image 0xBD81) returns a theme
+                         * number indexing 9-byte (3-colour) palette blocks at
+                         * 0xBCF6: block 0 (theme 1) is blue-ish, block 1 (theme 2,
+                         * at 0xBCFF) is the correct rose.  On real hardware the
+                         * ROM's pre-entry init settles the theme to 2 before the
+                         * first draw; our direct 5000:0000 entry skips that, so
+                         * the first draw reads block 0 (blue) straight from the
+                         * table and only "corrects" once navigation bumps the
+                         * theme to 2 (only idx 6/8/9 differ between the blocks).
+                         * Alias block 0 to block 1 in the loaded image so EVERY
+                         * draw reads rose regardless of the selected theme.
+                         * Disable with PC110NOPALFIX. */
+                        if (!getenv("PC110NOPALFIX")) {
+                            uint8_t rose9[9];
+                            cpu_physical_memory_read(0x00050000 + 0xBCFF,
+                                                     rose9, sizeof(rose9));
+                            cpu_physical_memory_write(0x00050000 + 0xBCF6,
+                                                      rose9, sizeof(rose9));
+                        }
                         env->segs[R_CS].selector = 0x5000;
                         env->segs[R_CS].base = 0x00050000;
                         env->segs[R_DS].selector = 0; env->segs[R_DS].base = 0;
