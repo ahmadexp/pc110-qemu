@@ -338,6 +338,17 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
     csbase = (uint32_t)env->segs[R_CS].base;
     if (csbase != 0xF0000 && csbase != 0x20000) {
         g_last_nonfseg = (uint32_t)pc; /* DOS/driver code (diag) */
+        /* DIAGNOSTIC (PC110HEARTBEAT): periodically report where non-BIOS code is
+         * executing, so steady-state health (driver idle loop vs. stuck) is
+         * observable without a debugger.  Counts only non-F-seg TB entries. */
+        if (getenv("PC110HEARTBEAT")) {
+            static unsigned long hb;
+            if ((++hb & 0x3FFFFF) == 0) {
+                fprintf(stderr, "[pc110post] heartbeat: non-BIOS TB @%05X "
+                        "(count=%luM booted=%d)\n", (unsigned)pc,
+                        hb >> 20, pc110_booted);
+            }
+        }
         return false;
     }
     cssel = (uint16_t)env->segs[R_CS].selector;
@@ -366,14 +377,29 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
      * 40:67 continuation, so DOS/driver init survives the reset.  40:72 only
      * gates the 0x0F==0 cold path, so setting it is safe on every reset. */
     if (csbase == 0xF0000 && off == 0x5516) {
-        static const uint8_t warmsig[2] = { 0x34, 0x12 }; /* 1234h, little-endian */
-        cpu_physical_memory_write(0x00000472, warmsig, 2);
+        /* Read the caller's existing 40:72 BEFORE touching it.  Pre-boot POST
+         * relies on the generic AT warm-boot magic 1234h to take the warm path.
+         * But POST-BOOT the PC110 resume driver leaves its OWN soft-resume magic
+         * 4321h in 40:72, which the resume gates at F000:4B07/4B27/4D2C compare
+         * against to stay on the clean resume continuation (jmp 4B96) instead of
+         * the cold re-POST arm.  Clobbering it to 1234h forced the cold arm ->
+         * CMOS 0x0F=01 -> PM re-entry (5BAA/5BEF) -> memtest reset -> the
+         * 01->02->07 shutdown-code cascade -> the 5B68 code-9D unexpected-int
+         * wedge.  So seed 1234h only PRE-boot; post-boot preserve the driver's
+         * value.  (The reference PC110-EMU never exercised this because it fakes
+         * protected mode and takes zero post-boot resets.) */
+        uint8_t cur72[2] = {0};
+        cpu_physical_memory_read(0x00000472, cur72, 2);
+        if (!pc110_booted) {
+            static const uint8_t warmsig[2] = { 0x34, 0x12 }; /* 1234h, LE */
+            cpu_physical_memory_write(0x00000472, warmsig, 2);
+        }
         g_reset_count++;
         if (getenv("PC110RSTLOG")) {
             static int rn;
             uint8_t v67[4] = {0}, v72[2] = {0};
             cpu_physical_memory_read(0x00000467, v67, 4);
-            cpu_physical_memory_read(0x00000472, v72, 2);
+            v72[0] = cur72[0]; v72[1] = cur72[1]; /* report PRE-existing 40:72 */
             char ring[256]; int rp = 0;
             for (int k = 32; k >= 2; k--) {
                 unsigned idx = (g_lin_ring_pos - k) & 31;
@@ -463,6 +489,108 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
                     fr[3], fr[2], fr[1], fr[0], fr[5], fr[4]);
         }
         return false;
+    }
+
+    /*
+     * DIAGNOSTIC (PC110RSTLOG): shutdown-byte writer F000:E9CE (rol/rcr AL to
+     * form index 0x8F, out 70h/4Fh, then out 71h,AH).  AH is the CMOS-0x0F
+     * shutdown code the BIOS is about to persist before a reset.  Logging it at
+     * routine entry tells us exactly which continuation code each reset selects
+     * (0x08 = halt/suspend @4B7E, 0x0A = PM-return @46CD, 0x01 = re-POST @4B96). */
+    if (csbase == 0xF0000 && off == 0xE9CE && getenv("PC110RSTLOG")) {
+        /* E9C6(al=index, ah=value): rol/stc/rcr forces bit7 so the CMOS index is
+         * (AL & 0x7F); it writes AH there.  Only (AL&0x7F)==0x0F touches the
+         * shutdown/phase byte -- every other index (0x30/0x31 mem-size, 0x34
+         * config, ...) is unrelated, so gate the SHUTDOWN-SET report on it. */
+        unsigned idx = env->regs[R_EAX] & 0x7F;
+        if (idx == 0x0F) {
+            static int seen;
+            if (seen++ < 48) {
+                uint32_t ssb = (uint32_t)env->segs[R_SS].base;
+                uint16_t sp = (uint16_t)env->regs[R_ESP];
+                uint8_t rc[2] = {0};
+                cpu_physical_memory_read(ssb + (uint16_t)(sp + 6), rc, 2);
+                fprintf(stderr, "[pc110post] SHUTDOWN-SET 0x0F<=%02X  "
+                        "(E9C6 caller=F000:%02X%02X prevTB=F000:%04X booted=%d)\n",
+                        (unsigned)((env->regs[R_EAX] >> 8) & 0xFF),
+                        rc[1], rc[0], (unsigned)prev_off, pc110_booted);
+            }
+        }
+        return false;
+    }
+
+    /* DIAGNOSTIC (PC110RSTLOG): the SMSW PM-exit fork at F000:4B75 (PE clear ->
+     * shutdown 08 + reset) vs F000:4B81 (PE set -> port-61 cleanup + reset).
+     * Which arm runs tells us whether CR0.PE survived into the reset entry. */
+    if (csbase == 0xF0000 && getenv("PC110RSTLOG") &&
+        (off == 0x4B75 || off == 0x4B81)) {
+        static int seen;
+        if (seen++ < 24) {
+            fprintf(stderr, "[pc110post] SMSW-FORK @%04X  %s  AX(msw)=%04X CR0=%08X "
+                    "(booted=%d)\n", (unsigned)off,
+                    off == 0x4B75 ? "PE-CLEAR->shutdown08" : "PE-SET->port61",
+                    (unsigned)(env->regs[R_EAX] & 0xFFFF),
+                    (unsigned)env->cr[0], pc110_booted);
+        }
+        return false;
+    }
+
+    /*
+     * DIAGNOSTIC (PC110RSTLOG): resume dispatch fall-through F000:469D.  By here
+     * the BIOS reset entry has read CMOS 0x0F into AL (via 465C/4695) and cleared
+     * the NVRAM byte; AL is the shutdown code and it is about to jump through
+     * table[AL] @46A9.  Log AL + the resolved handler so we can see where each
+     * resume actually lands (and confirm the 0x08->4B7E halt-loop wedge). */
+    if (csbase == 0xF0000 && off == 0x469D && getenv("PC110RSTLOG")) {
+        static int seen;
+        if (seen++ < 48) {
+            unsigned code = env->regs[R_EAX] & 0xFF;
+            uint8_t hw[2] = {0};
+            cpu_physical_memory_read(0xF0000 + 0x46A9 + 2u * code, hw, 2);
+            fprintf(stderr, "[pc110post] RESUME-DISPATCH code=%02X -> F000:%02X%02X  "
+                    "(booted=%d)\n", code, hw[1], hw[0], pc110_booted);
+        }
+        return false;
+    }
+
+    /*
+     * THE POST-BOOT RESUME FIX (default on; disable with PC110NORESUME).
+     *
+     * The Personaware/RIOS power driver runs a protected-mode idle loop: each
+     * iteration it enters PM, does work, and exits PM the 286 way -- KBC-0xFE
+     * reset with CMOS 0x0F = 09 (resume) so the reset entry F000:4656 dispatches
+     * to the resume handler F000:A6E4 (restore SS:SP from 40:67/40:69, disable
+     * A20, LIDT real-mode IDT, popa/retf back to the driver).  Those tagged
+     * resets resume cleanly.  But the driver also invokes a BIOS service that
+     * runs a "reinit + re-enter PM + reset" sequence (F4304 trampoline -> DD0F
+     * -> ... -> F4A5D, which unconditionally LMSW-enters PM at F5BEF and resets
+     * via the memory sizer) WITHOUT tagging 0x0F.  On real hardware that path
+     * resumes; under QEMU the untagged reset cold-POSTs and the warm re-POST
+     * diverges into an unexpected-interrupt (5B68, code 9D) wedge, cascading the
+     * shutdown code 00->01->02->07.  The reference emulator PC110-EMU sidesteps
+     * all of this by faking protected mode (zero post-boot resets).
+     *
+     * We approximate the reference: the reset entry reaches F000:4656 in REAL
+     * mode (the CPU-only reset cleared CR0.PE), so we redirect straight to the
+     * genuine BIOS resume handler A6E4, which returns to the driver's last saved
+     * 40:67/40:69 context.  This keeps the driver on its clean resume/idle loop
+     * instead of cold-re-POSTing, and it is safe for the already-good 09 cycles
+     * (they dispatch to A6E4 anyway).  Gated on pc110_booted so pre-boot POST,
+     * which legitimately cold/warm-POSTs, is untouched. */
+    if (csbase == 0xF0000 && off == 0x4656 && pc110_booted &&
+        !getenv("PC110NORESUME")) {
+        if (getenv("PC110RSTLOG")) {
+            static int seen;
+            if (seen++ < 32) {
+                uint8_t v67[4] = {0};
+                cpu_physical_memory_read(0x00000467, v67, 4);
+                fprintf(stderr, "[pc110post] FORCE-RESUME @4656 -> A6E4  "
+                        "40:67=%02X%02X:%02X%02X\n",
+                        v67[3], v67[2], v67[1], v67[0]);
+            }
+        }
+        env->eip = 0xA6E4;
+        return true;
     }
 
     /*

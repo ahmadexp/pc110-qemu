@@ -3,14 +3,21 @@
 #
 # Status: the real BIOS runs the full POST (memory sizing, chipset self-tests,
 # the C&T flat-panel VGA BIOS, the KBC warm-reset state machine), boots the
-# disk via a software INT19/INT13 service, and runs the MS-DOS 7 kernel +
-# CONFIG.SYS drivers.  It does NOT yet reach the Personaware desktop: a RIOS
-# PC110 driver takes a divergent init path that ends in a POST re-entry loop.
+# disk via a software INT19/INT13 service, runs the MS-DOS 7 kernel + CONFIG.SYS
+# drivers, and now reaches a STABLE post-boot idle state: the RIOS/Personaware
+# power driver's protected-mode idle loop (enter PM, KBC-0xFE reset to exit PM,
+# resume) runs without crashing.  The old terminal wedge -- an untagged post-DOS
+# reset that cold-re-POSTed and cascaded into an unexpected-interrupt HLT -- is
+# fixed by resuming those resets through the BIOS's own resume handler (F000:A6E4)
+# instead of cold-booting (target/i386/pc110post.c; disable with PC110NORESUME).
+# It does NOT yet render the desktop on-screen: the Chips & Technologies F65535
+# flat-panel VGA mode-set is not modeled, so the framebuffer stays blank even
+# though DOS + the driver stack are running underneath.
 # See README "Booting the real BIOS" for the full write-up.
 #
 # The POST completer is enabled by the PC110POST env var and reads the boot
 # image named by PC110BOOT.  PC110RSTLOG=1 turns on the (verbose) reset/driver
-# diagnostics used while investigating the remaining divergence.
+# diagnostics; PC110HEARTBEAT=1 samples where non-BIOS code runs at steady state.
 #
 # Requires:
 #   qemu-src/build/qemu-system-i386   (scripts/build-qemu.sh)

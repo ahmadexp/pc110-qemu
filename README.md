@@ -115,12 +115,23 @@ observed via the instruction trace / `PC110RSTLOG`.)
   and services disk I/O out of the disk image, and the MS-DOS 7 kernel plus the
   `CONFIG.SYS` driver stack (HIMEM, EMM386, the RIOS `$FONT`/`$DISP`/`$IAS`
   drivers) load and run.
-- **Not yet: the Personaware desktop.** The terminal blocker is the PC110
-  **power-management / suspend-resume path**: the RIOS `POWER.EXE ADV:MAX`
-  driver programs the VL82C420 self-refresh/clock-stop registers and takes the
-  286-era KBC-`0xFE` reset expecting a *suspend → resume*, which QEMU does not
-  yet model (it warm-re-POSTs instead of resuming). Reaching the desktop needs
-  that subsystem, on top of the config-window fidelity below.
+- **Stable post-boot idle (no more wedge).** The RIOS `POWER.EXE ADV:MAX` driver
+  runs a **protected-mode idle loop**: each iteration it enters PM, does work,
+  and exits PM the 286 way — a KBC-`0xFE` reset — expecting a *suspend → resume*.
+  Most of those resets carry the resume shutdown code (`CMOS 0x0F = 09`) and the
+  BIOS reset entry dispatches them to its resume handler `F000:A6E4` (restore
+  `SS:SP` from `40:67/69`, drop A20, load the real-mode IDT, `retf` back to the
+  driver) — those resume cleanly. But the driver also invokes a BIOS service that
+  resets *without* tagging `0x0F`; on real hardware that resumes, whereas QEMU
+  cold-re-POSTed it and cascaded into an unexpected-interrupt `HLT` wedge
+  (shutdown codes `00→01→02→07`). That wedge is now **fixed**: post-boot resets
+  are steered through the genuine `A6E4` resume handler instead of cold-booting,
+  so the driver's idle loop runs indefinitely without crashing.
+- **Not yet: the desktop *on screen*.** DOS and the full driver stack are running
+  underneath, but the Chips & Technologies **F65535 flat-panel VGA** mode-set is
+  not modeled, so the framebuffer stays blank. Rendering the desktop needs that
+  video device (and a wake source to bring the machine out of its idle/suspend),
+  on top of the config-window fidelity below.
 
 The `pc110-chipset` device now models the VL82C420's config windows against the
 live-hardware register maps in the **Open-Source-PC110** project's
@@ -140,12 +151,17 @@ How it works (`qemu/target-i386/pc110post.c`, applied via `qemu/patches/`):
 - The KBC `0xFE` reset is turned into a synchronous **CPU-only** reset (RAM
   preserved) instead of QEMU's async full-machine reset, matching the 286-era
   protected-mode-exit idiom the BIOS/driver rely on.
+- **Post-boot resets resume, they don't cold-boot.** Once DOS has booted, the
+  reset entry (`F000:4656`) is redirected to the BIOS resume handler `F000:A6E4`
+  instead of being allowed to read `CMOS 0x0F` and fall into cold POST. This
+  approximates what the PC110-EMU reference does (it fakes PM and never resets)
+  and keeps the power driver's idle loop alive. Disable with `PC110NORESUME=1`.
 - `pc110-chipset` supplies the ROM/shadow map (C0000-DFFFF ROM, E0000-EFFFF a
   DOS UMB that becomes writable after boot, F0000-FFFFF shadow RAM) and the
   VLSI/SCAMP + CMOS register banks seeded from a real-hardware dump.
 
-Set `PC110RSTLOG=1` for verbose reset/driver tracing (used while chasing the
-remaining divergence).
+Set `PC110RSTLOG=1` for verbose reset/driver tracing, or `PC110HEARTBEAT=1` to
+sample where non-BIOS code executes in the steady state.
 
 ## Status / limitations
 
@@ -153,7 +169,9 @@ remaining divergence).
 - Easy-Setup renders and its menu is navigable, but it still calls a few PC110
   BIOS service routines that don't exist under SeaBIOS, so some in-menu actions
   may not fully function; entering it and exiting back to Personaware work.
-- The real-BIOS path (above) boots DOS but does not yet reach the desktop.
+- The real-BIOS path (above) boots DOS and the driver stack and reaches a stable
+  post-boot idle (the reset-cascade wedge is fixed), but the desktop is not yet
+  rendered on-screen because the C&T F65535 flat-panel VGA is unmodeled.
 
 ## Credits
 
