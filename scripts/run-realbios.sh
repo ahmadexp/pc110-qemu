@@ -1,23 +1,23 @@
 #!/bin/sh
 # EXPERIMENTAL: boot the REAL 256 KiB IBM PC110 BIOS on QEMU (not SeaBIOS).
 #
-# Status: the real BIOS runs the full POST (memory sizing, chipset self-tests,
-# the C&T flat-panel VGA BIOS, the KBC warm-reset state machine), boots the
-# disk via a software INT19/INT13 service, runs the MS-DOS 7 kernel + CONFIG.SYS
-# drivers, and now reaches a STABLE post-boot idle state: the RIOS/Personaware
-# power driver's protected-mode idle loop (enter PM, KBC-0xFE reset to exit PM,
-# resume) runs without crashing.  The old terminal wedge -- an untagged post-DOS
-# reset that cold-re-POSTed and cascaded into an unexpected-interrupt HLT -- is
-# fixed by resuming those resets through the BIOS's own resume handler (F000:A6E4)
-# instead of cold-booting (target/i386/pc110post.c; disable with PC110NORESUME).
-# It does NOT yet render the desktop on-screen: the Chips & Technologies F65535
-# flat-panel VGA mode-set is not modeled, so the framebuffer stays blank even
-# though DOS + the driver stack are running underneath.
+# Status: the real BIOS boots ALL THE WAY to the Personaware pen desktop -- POST,
+# DOS, the RIOS driver stack, the VGA mode-12h handoff, and the launcher, all
+# driven by the genuine 256 KiB ROM.  Two things make it work:
+#   1. Loose protected mode (qemu/patches/05-seg-helper-loose-pm.patch): post-boot,
+#      QEMU's PM segment helpers do base-only resolution with no type/privilege
+#      checks, so the BIOS/driver's "unreal mode" (PE=1 with real-mode segment
+#      values) does not #GP-storm.  Mirrors PC110-EMU's segment resolver.
+#   2. A CONFIG.SYS WITHOUT EMM386.  EMM386's V86/paging monitor assumes faithful
+#      PM and conflicts with the driver's unreal-mode segment use; removing it
+#      leaves loose PM as the only regime and the boot runs clean to the desktop.
+#      (See disks/README.md for the one-line mtools recipe to strip EMM386.)
 # See README "Booting the real BIOS" for the full write-up.
 #
-# The POST completer is enabled by the PC110POST env var and reads the boot
-# image named by PC110BOOT.  PC110RSTLOG=1 turns on the (verbose) reset/driver
-# diagnostics; PC110HEARTBEAT=1 samples where non-BIOS code runs at steady state.
+# The POST completer is enabled by the PC110POST env var and reads the boot image
+# named by PC110BOOT.  PC110RSTLOG=1 turns on verbose reset/driver diagnostics;
+# PC110HEARTBEAT=1 samples where non-BIOS code runs; PC110RESUME=1 re-enables the
+# legacy A6E4 reset-resume shim (superseded by loose PM).
 #
 # Requires:
 #   qemu-src/build/qemu-system-i386   (scripts/build-qemu.sh)

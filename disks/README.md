@@ -54,3 +54,26 @@ mdel  -i disks/Personaware-disk.img@@16384 ::CONFIG.SYS
 mcopy -i disks/Personaware-disk.img@@16384 /tmp/config.sys ::CONFIG.SYS
 ```
 
+## Real-BIOS boot: remove EMM386
+
+The **real-BIOS** path (`scripts/run-realbios.sh`) needs a `CONFIG.SYS` that does
+**not** load EMM386. EMM386's V86/paging monitor assumes faithful protected mode
+and conflicts with the PC110 driver stack's "unreal mode" segment usage; with it
+loaded the boot faults out (EMM386 "error #06/#13") before the GUI. Removing it
+leaves the driver's loose protected mode as the only regime and the boot runs
+clean to the Personaware desktop. Make a real-BIOS variant of the disk:
+
+```
+cp disks/Personaware-disk.img disks/Personaware-realbios.img
+mcopy -i disks/Personaware-realbios.img@@16384 ::CONFIG.SYS /tmp/cfg
+sed -e 's/^DEVICE=C:\\DOS\\EMM386.EXE.*/REM EMM386 removed for the real-BIOS path/' \
+    -e 's/^DOS=HIGH,UMB/DOS=HIGH/' -e 's/^DOSDATA=UMB/REM DOSDATA=UMB/' \
+    -e 's/^DEVICEHIGH=/DEVICE=/' /tmp/cfg > /tmp/cfg.noemm
+mdel  -i disks/Personaware-realbios.img@@16384 ::CONFIG.SYS
+mcopy -i disks/Personaware-realbios.img@@16384 /tmp/cfg.noemm ::CONFIG.SYS
+# then: PC110_DISK=disks/Personaware-realbios.img scripts/run-realbios.sh
+```
+
+(Booting the *stock* EMM386 configuration on the real BIOS is future work — it
+needs a V86-aware loose-PM model.)
+

@@ -1,10 +1,11 @@
 # PC110-QEMU
 
 Run the IBM Palm Top PC 110's software on QEMU using the real machine ROMs:
-**IBM Personaware** (the Japanese pen GUI) boots with genuine kanji rendering,
-and the real PC110 **Easy-Setup** BIOS screen runs under SeaBIOS.
+**IBM Personaware** (the Japanese pen GUI) boots with genuine kanji rendering —
+now including straight off the **real 256 KiB PC110 BIOS**, all the way to the
+pen desktop.
 
-![Personaware launcher](docs/personaware.png)
+![Personaware on the real PC110 BIOS](docs/personaware-realbios.png)
 ![Easy-Setup menu](docs/easy-setup-menu.png)
 
 This repository is a small set of QEMU device models plus build/run tooling. It
@@ -13,13 +14,18 @@ obtained dumps (see [`roms/`](roms/README.md) and [`disks/`](disks/README.md)).
 
 ## What works
 
-- **Personaware** boots to its full pen-driven launcher (Schedule, ToDo,
-  Notebook, Address, E-Mail, FAX, Telephone, IR Connect, World Clock,
-  Calculator, Editor, Draw Memo, Game, Personal, DOS, Power MGT) with sharp
-  kanji drawn straight from the PC110 font ROM. The disk is a 4 MB FAT12 image
-  (matching the real unit's internal storage) so Personaware boots straight to a
-  clean launcher — a disk with 512-byte clusters trips a bogus "low disk space"
-  dialog regardless of how much is free (see [`disks/`](disks/README.md)).
+- **Personaware on the real PC110 BIOS** (`scripts/run-realbios.sh`) — the
+  genuine 256 KiB ROM POSTs, boots DOS, runs the RIOS driver stack, hands off to
+  VGA mode 12h and paints the full pen launcher with kanji from the font ROM.
+  See [Booting the real BIOS](#booting-the-real-bios) for how, and the note there
+  about running a `CONFIG.SYS` without EMM386.
+- **Personaware on SeaBIOS** boots to the same full pen-driven launcher
+  (Schedule, ToDo, Notebook, Address, E-Mail, FAX, Telephone, IR Connect, World
+  Clock, Calculator, Editor, Draw Memo, Game, Personal, DOS, Power MGT) with
+  sharp kanji from the PC110 font ROM. The disk is a 4 MB FAT12 image (matching
+  the real unit's internal storage) so it boots straight to a clean launcher — a
+  disk with 512-byte clusters trips a bogus "low disk space" dialog regardless of
+  how much is free (see [`disks/`](disks/README.md)).
 - **Easy-Setup** (the real graphical F1 BIOS setup: Config / Date-Time /
   Password / Start up / Test / Restart) runs under SeaBIOS and renders from the
   genuine BIOS ROM. Exiting it returns to normal Personaware mode.
@@ -99,79 +105,77 @@ high-DPI/Retina Mac); set `QEMU_COCOA_SCALE=N` to change it (1 = native). It is
 still freely resizable — drag a corner, or press Ctrl+Cmd+F for full screen.
 Quit with Ctrl+Cmd+Q.
 
-## Booting the real BIOS (experimental)
+## Booting the real BIOS
 
 `scripts/run-realbios.sh` boots the genuine 256 KiB PC110 BIOS on QEMU instead
-of SeaBIOS. This is a work in progress, but it now gets a long way. (No
-screenshot yet: the boot drives the Chips & Technologies F65535 flat-panel VGA,
-whose mode-set QEMU's stock `-vga std` doesn't model, so nothing renders
-on-screen even though POST and DOS are running underneath — progress is
-observed via the instruction trace / `PC110RSTLOG`.)
+of SeaBIOS, and **reaches the full Personaware pen desktop** — POST, DOS, the
+RIOS driver stack, the mode-12h video handoff, and the launcher, all driven by
+the real ROM (screenshot at the top of this README).
 
-- **POST completes** — memory sizing, chipset self-tests, the timer/refresh
-  calibration, the Chips & Technologies flat-panel VGA BIOS (video mode set),
-  and the KBC warm-reset state machine all pass.
+- **POST completes** — memory sizing, chipset self-tests, timer/refresh
+  calibration, the KBC warm-reset state machine.
 - **DOS boots** — a software `INT 19h`/`INT 13h` service loads the boot sector
-  and services disk I/O out of the disk image, and the MS-DOS 7 kernel plus the
-  `CONFIG.SYS` driver stack (HIMEM, EMM386, the RIOS `$FONT`/`$DISP`/`$IAS`
-  drivers) load and run.
-- **Stable post-boot idle (no more wedge).** The RIOS `POWER.EXE ADV:MAX` driver
-  runs a **protected-mode idle loop**: each iteration it enters PM, does work,
-  and exits PM the 286 way — a KBC-`0xFE` reset — expecting a *suspend → resume*.
-  Most of those resets carry the resume shutdown code (`CMOS 0x0F = 09`) and the
-  BIOS reset entry dispatches them to its resume handler `F000:A6E4` (restore
-  `SS:SP` from `40:67/69`, drop A20, load the real-mode IDT, `retf` back to the
-  driver) — those resume cleanly. But the driver also invokes a BIOS service that
-  resets *without* tagging `0x0F`; on real hardware that resumes, whereas QEMU
-  cold-re-POSTed it and cascaded into an unexpected-interrupt `HLT` wedge
-  (shutdown codes `00→01→02→07`). That wedge is now **fixed**: post-boot resets
-  are steered through the genuine `A6E4` resume handler instead of cold-booting,
-  so the driver's idle loop runs indefinitely without crashing.
-- **Not yet: the desktop *on screen*.** DOS and the full driver stack are running
-  underneath, but the Chips & Technologies **F65535 flat-panel VGA** mode-set is
-  not modeled, so the framebuffer stays blank. Rendering the desktop needs that
-  video device (and a wake source to bring the machine out of its idle/suspend),
-  on top of the config-window fidelity below.
+  and services disk I/O from the image; the PC-DOS kernel and the `CONFIG.SYS`
+  driver stack (HIMEM, the RIOS `$FONT`/`$DISP`/`$IAS` drivers, `POWER.EXE`,
+  `IBMMKKV`) plus `AUTOEXEC.BAT` (`KEYB`, `MOUSE`, `INKDRV`, `PW.BAT`) run.
+- **Personaware renders** — `MET.COM` switches to VGA mode 12h (640×480×16,
+  which QEMU's stock `-vga std` draws directly) and paints the launcher with
+  kanji from the font ROM.
 
-The `pc110-chipset` device now models the VL82C420's config windows against the
+### The two pieces that make it work
+
+1. **Loose protected mode** (`qemu/patches/05-seg-helper-loose-pm.patch`). The
+   PC110 BIOS + drivers run long stretches in *unreal mode* — `CR0.PE=1` while
+   loading real-mode-style segment values (`F000`, VGA selectors, …). A faithful
+   x86 core (QEMU) `#GP`s on every such segment op, producing an endless
+   general-protection fault storm. Post-boot, under `PC110POST`, QEMU's PM
+   segment helpers (`load_seg`, far `jmp`/`call`/`ret`/`iret`, interrupt
+   delivery) instead do **base-only resolution with no type/privilege/present
+   checks** — using a descriptor's real base when its access byte is non-zero and
+   `selector<<4` otherwise, and delivering interrupts same-privilege so frames
+   stay balanced. This mirrors the reference emulator **PC110-EMU**'s
+   `pc110_segment_base_for_selector`. Pre-boot POST is untouched (faithful PM).
+2. **No EMM386.** EMM386's V86/paging monitor assumes *faithful* PM and conflicts
+   irreconcilably with the driver's unreal-mode segment usage. Removing it from
+   `CONFIG.SYS` (see [`disks/`](disks/README.md)) leaves the driver's loose PM as
+   the only regime, and the boot runs clean to the desktop. (EMM386 support is
+   future work — it would need a full V86-aware loose-PM model.)
+
+The `pc110-chipset` device models the VL82C420's config windows against the
 live-hardware register maps in the **Open-Source-PC110** project's
 [`Discovery/Chipset`](https://github.com/ahmadexp/Open-Source-PC110/tree/main/Discovery/Chipset):
 the SCAMP window (`0x74/0x76`), the **block2** POST/init window (`0x24/0x25`,
-seeded from the live dump — incl. the DRAM-timing and SMI I/O-trap descriptors),
-and the clock-stop / config-lock latches (`0x22/0x23`, `0x302`, `0x704`). The
-EC/ED shadow/cache/ROM-decode window and the full suspend/resume path are the
-remaining pieces.
+seeded from the live dump), and the clock-stop / config-lock latches
+(`0x22/0x23`, `0x302`, `0x704`).
 
-How it works (`qemu/target-i386/pc110post.c`, applied via `qemu/patches/`):
+How it works (`qemu/target-i386/pc110post.c` + `qemu/patches/`):
 
 - A TCG-level completer hooked into the CPU exec loop (enabled by the
   `PC110POST` env var) short-circuits POST wait-loops that never converge under
-  emulation, seeds the warm-boot contract (`40:72 = 1234h`) around the KBC
-  CPU-reset, and services `INT 19h`/`INT 13h` from `$PC110BOOT`.
-- The KBC `0xFE` reset is turned into a synchronous **CPU-only** reset (RAM
-  preserved) instead of QEMU's async full-machine reset, matching the 286-era
+  emulation, seeds the warm-boot contract around the KBC CPU-reset, and services
+  `INT 19h`/`INT 13h` from `$PC110BOOT`.
+- The KBC `0xFE` reset is a synchronous **CPU-only** reset (RAM preserved)
+  instead of QEMU's async full-machine reset, matching the 286-era
   protected-mode-exit idiom the BIOS/driver rely on.
-- **Post-boot resets resume, they don't cold-boot.** Once DOS has booted, the
-  reset entry (`F000:4656`) is redirected to the BIOS resume handler `F000:A6E4`
-  instead of being allowed to read `CMOS 0x0F` and fall into cold POST. This
-  approximates what the PC110-EMU reference does (it fakes PM and never resets)
-  and keeps the power driver's idle loop alive. Disable with `PC110NORESUME=1`.
 - `pc110-chipset` supplies the ROM/shadow map (C0000-DFFFF ROM, E0000-EFFFF a
   DOS UMB that becomes writable after boot, F0000-FFFFF shadow RAM) and the
   VLSI/SCAMP + CMOS register banks seeded from a real-hardware dump.
 
-Set `PC110RSTLOG=1` for verbose reset/driver tracing, or `PC110HEARTBEAT=1` to
-sample where non-BIOS code executes in the steady state.
+Set `PC110RSTLOG=1` for verbose reset/driver tracing; `PC110HEARTBEAT=1` samples
+where non-BIOS code executes; `PC110RESUME=1` re-enables the legacy A6E4
+reset-resume shim (superseded by loose PM).
 
 ## Status / limitations
 
-- **Personaware** (SeaBIOS) and **Easy-Setup** are the fully working paths.
+- **Personaware** (both the real-BIOS and SeaBIOS paths) and **Easy-Setup** all
+  reach their GUIs.
+- The **real-BIOS** path reaches the Personaware desktop with a `CONFIG.SYS` that
+  does not load EMM386 (see [Booting the real BIOS](#booting-the-real-bios)).
+  Booting the stock EMM386 configuration on the real BIOS is future work (needs a
+  V86-aware loose-PM model).
 - Easy-Setup renders and its menu is navigable, but it still calls a few PC110
   BIOS service routines that don't exist under SeaBIOS, so some in-menu actions
   may not fully function; entering it and exiting back to Personaware work.
-- The real-BIOS path (above) boots DOS and the driver stack and reaches a stable
-  post-boot idle (the reset-cascade wedge is fixed), but the desktop is not yet
-  rendered on-screen because the C&T F65535 flat-panel VGA is unmodeled.
 
 ## Credits
 

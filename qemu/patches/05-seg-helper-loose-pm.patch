@@ -1,0 +1,309 @@
+--- a/target/i386/tcg/seg_helper.c
++++ b/target/i386/tcg/seg_helper.c
+@@ -62,6 +62,139 @@
+     int mmu_index;
+ } StackAccess;
+ 
++/*
++ * PC110 "loose protected mode" scaffold (enabled by the PC110POST env var).
++ *
++ * The genuine IBM PC110 BIOS + RIOS driver stack runs stretches of code in an
++ * "unreal mode" state: it sets CR0.PE=1 with LMSW but keeps loading real-mode
++ * style segment values (e.g. F000) into segment registers, and takes interrupts
++ * / IRETs while in that state.  On a faithful x86 (QEMU) every such segment
++ * operation #GPs because those selectors have no valid GDT descriptor, which
++ * produces an endless general-protection fault storm.  The reference emulator
++ * PC110-EMU boots this same BIOS to the desktop precisely because its segment
++ * resolver (pc110_segment_base_for_selector) FALLS BACK to selector<<4 (with a
++ * couple of hardcoded PC110 bases) whenever the GDT descriptor is absent.
++ *
++ * pc110_synth_desc() reproduces that: when the requested selector has no valid
++ * descriptor, synthesise a present 16-bit segment descriptor whose base is
++ * selector<<4 (0x40->0xF0000, 0x38/0x48->0), so the load succeeds like it does
++ * on the reference instead of faulting.
++ */
++extern int pc110_booted; /* set by target/i386/pc110post.c once DOS has booted */
++
++static int pc110_loose_pm(void)
++{
++    static int en = -1;
++    if (en < 0) {
++        en = getenv("PC110POST") ? 1 : 0;
++    }
++    /* Only loosen PM AFTER DOS has booted: pre-boot POST runs correctly under
++     * faithful protected mode; the loose scaffold is only needed for the
++     * driver's post-boot unreal-mode segment usage. */
++    return en && pc110_booted;
++}
++
++static uint32_t pc110_loose_base(unsigned selector)
++{
++    selector &= 0xffff;
++    if (selector == 0x0040) {
++        return 0x000F0000;
++    }
++    if (selector == 0x0038 || selector == 0x0048) {
++        return 0x00000000;
++    }
++    return (uint32_t)selector << 4;
++}
++
++/*
++ * Resolve a selector's base exactly like PC110-EMU's
++ * pc110_segment_base_for_selector: use the GDT/LDT descriptor's base ONLY when
++ * the descriptor's access byte (bits 15:8 of e2) is non-zero; otherwise (empty
++ * or absent descriptor) fall back to selector<<4.  Loading an empty descriptor's
++ * stale base is what sent CS=0x70 to 0xA0000 (VGA memory) -> #UD.
++ */
++static inline uint32_t get_seg_base(uint32_t e1, uint32_t e2);
++
++static inline uint32_t get_seg_limit(uint32_t e1, uint32_t e2);
++
++static uint32_t pc110_resolve_base(CPUX86State *env, unsigned selector)
++{
++    unsigned index = selector & ~7u;
++    SegmentCache *dt = (selector & 4) ? &env->ldt : &env->gdt;
++    if ((selector & 0xfffc) != 0 && (index + 7) <= dt->limit) {
++        uint32_t e1 = cpu_ldl_kernel_ra(env, dt->base + index, 0);
++        uint32_t e2 = cpu_ldl_kernel_ra(env, dt->base + index + 4, 0);
++        if (((e2 >> 8) & 0xffu) != 0) {
++            return get_seg_base(e1, e2);
++        }
++    }
++    return pc110_loose_base(selector);
++}
++
++/*
++ * Full loose-PM segment resolution.  For a selector with a valid (access!=0)
++ * in-limit descriptor, return its REAL base/limit/flags -- crucially preserving
++ * 32-bit-ness (DESC_B/DESC_G), because EMM386's own code/data segments are
++ * 32-bit and running them as forced-16-bit misdecodes instructions and derails
++ * control flow.  Only for empty/out-of-limit selectors do we synthesise a
++ * real-mode-style 16-bit segment based at selector<<4.
++ */
++static void pc110_resolve_seg(CPUX86State *env, unsigned selector, int is_code,
++                              uint32_t *base, uint32_t *limit, uint32_t *flags)
++{
++    unsigned index = selector & ~7u;
++    SegmentCache *dt = (selector & 4) ? &env->ldt : &env->gdt;
++    if ((selector & 0xfffc) != 0 && (index + 7) <= dt->limit) {
++        uint32_t e1 = cpu_ldl_kernel_ra(env, dt->base + index, 0);
++        uint32_t e2 = cpu_ldl_kernel_ra(env, dt->base + index + 4, 0);
++        if (((e2 >> 8) & 0xffu) != 0) {
++            *base = get_seg_base(e1, e2);
++            *limit = get_seg_limit(e1, e2);
++            *flags = e2 | DESC_P_MASK;
++            return;
++        }
++    }
++    *base = pc110_loose_base(selector);
++    *limit = 0xffff;
++    *flags = DESC_P_MASK | DESC_S_MASK | DESC_A_MASK |
++             (is_code ? (DESC_CS_MASK | DESC_R_MASK) : DESC_W_MASK);
++}
++
++/* Diagnostic: flag any loose far transfer that lands CS in the VGA aperture
++ * (0xA0000-0xBFFFF) -- executing there means a bad control transfer. */
++static void pc110_dbg_cs(CPUX86State *env, const char *tag, unsigned sel,
++                         uint32_t base, uint32_t neweip)
++{
++    if (base >= 0x000A0000 && base < 0x000C0000 && getenv("PC110RSTLOG")) {
++        static int n;
++        if (n++ < 24) {
++            fprintf(stderr, "[pc110loose] %s CS<=%04x base=%05X eip=%04X  "
++                    "from %04x:%08x SP=%04x:%08x\n", tag, sel, (unsigned)base,
++                    (unsigned)neweip, env->segs[R_CS].selector,
++                    (unsigned)env->eip, env->segs[R_SS].selector,
++                    (unsigned)env->regs[R_ESP]);
++        }
++    }
++}
++
++/* Synthesise e1/e2 for a real-mode-style (unreal) selector; returns true when
++ * the loose-PM scaffold is active. */
++static bool pc110_synth_desc(unsigned selector, int is_code,
++                             uint32_t *e1, uint32_t *e2)
++{
++    uint32_t base;
++    if (!pc110_loose_pm()) {
++        return false;
++    }
++    base = pc110_loose_base(selector);
++    *e1 = ((base & 0xffffu) << 16) | 0xffffu;                 /* base[15:0], limit */
++    *e2 = ((base >> 16) & 0xffu) | (base & 0xff000000u)       /* base[23:16],[31:24] */
++        | DESC_P_MASK | DESC_S_MASK | DESC_A_MASK
++        | (((uint32_t)selector & 3u) << DESC_DPL_SHIFT)
++        | (is_code ? (DESC_CS_MASK | DESC_R_MASK) : DESC_W_MASK);
++    return true;
++}
++
+ static void pushw(StackAccess *sa, uint16_t val)
+ {
+     sa->sp -= 2;
+@@ -762,12 +895,23 @@
+         raise_exception_err(env, EXCP0D_GPF, 0);
+     }
+     if (load_segment(env, &e1, &e2, selector) != 0) {
+-        raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
++        if (!pc110_synth_desc(selector, 1, &e1, &e2)) {
++            raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
++        }
+     }
+     if (!(e2 & DESC_S_MASK) || !(e2 & (DESC_CS_MASK))) {
+         raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
+     }
+     dpl = (e2 >> DESC_DPL_SHIFT) & 3;
++    /* Loose PM (PC110, post-boot, non-V86): deliver the interrupt at the same
++     * privilege level (no TSS stack switch) so the frame pushed here matches
++     * the same-privilege loose IRET that pops it.  Without this, faithful PM
++     * pushes an extra SS:SP on a privilege change while the loose IRET pops
++     * only CS:IP:FLAGS -- the SP drifts and later far RETs pop stack garbage
++     * (e.g. into VGA memory -> #UD). */
++    if (pc110_loose_pm() && !vm86) {
++        dpl = cpl;
++    }
+     if (dpl > cpl) {
+         raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
+     }
+@@ -1008,7 +1152,9 @@
+     }
+ 
+     if (load_segment(env, &e1, &e2, selector) != 0) {
+-        raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
++        if (!pc110_synth_desc(selector, 1, &e1, &e2)) {
++            raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
++        }
+     }
+     if (!(e2 & DESC_S_MASK) || !(e2 & (DESC_CS_MASK))) {
+         raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
+@@ -1421,12 +1567,30 @@
+         }
+         index = selector & ~7;
+         if ((index + 7) > dt->limit) {
++            uint32_t le1, le2;
++            if (pc110_synth_desc(selector, seg_reg == R_CS, &le1, &le2)) {
++                cpu_x86_load_seg_cache(env, seg_reg, selector,
++                                       get_seg_base(le1, le2),
++                                       get_seg_limit(le1, le2), le2);
++                return;
++            }
+             raise_exception_err_ra(env, EXCP0D_GPF, selector & 0xfffc, GETPC());
+         }
+         ptr = dt->base + index;
+         e1 = cpu_ldl_kernel_ra(env, ptr, GETPC());
+         e2 = cpu_ldl_kernel_ra(env, ptr + 4, GETPC());
+ 
++        if (pc110_loose_pm()) {
++            /* Loose PM (PC110): no type/privilege/present rules, but preserve
++             * the real descriptor (base/limit/32-bit flags) for valid slots and
++             * fall back to selector<<4 only for empty/out-of-limit selectors. */
++            uint32_t lbase, llimit, lflags;
++            pc110_resolve_seg(env, selector, seg_reg == R_CS,
++                              &lbase, &llimit, &lflags);
++            cpu_x86_load_seg_cache(env, seg_reg, selector, lbase, llimit, lflags);
++            return;
++        }
++
+         if (!(e2 & DESC_S_MASK)) {
+             raise_exception_err_ra(env, EXCP0D_GPF, selector & 0xfffc, GETPC());
+         }
+@@ -1486,6 +1650,17 @@
+     int gate_cs, type;
+     uint32_t e1, e2, cpl, dpl, rpl, limit;
+ 
++    /* Loose PM (PC110, post-boot): a far jump is a plain CS load with base-only
++     * resolution and no gate/privilege checks -- consistent with the loose
++     * ret/iret and lcall so control-transfer frames stay in sync. */
++    if (pc110_loose_pm()) {
++        uint32_t lb, ll, lf;
++        pc110_resolve_seg(env, new_cs, 1, &lb, &ll, &lf);
++        pc110_dbg_cs(env, "ljmp", new_cs, lb, new_eip);
++        cpu_x86_load_seg_cache(env, R_CS, new_cs, lb, ll, lf);
++        env->eip = new_eip;
++        return;
++    }
+     if ((new_cs & 0xfffc) == 0) {
+         raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+     }
+@@ -1660,6 +1835,34 @@
+ 
+     LOG_PCALL("lcall %04x:" TARGET_FMT_lx " s=%d\n", new_cs, new_eip, shift);
+     LOG_PCALL_STATE(env_cpu(env));
++    /* Loose PM (PC110, post-boot): a far call is a same-privilege push of the
++     * return CS:IP followed by a base-only CS load -- no gate/privilege checks,
++     * no stack switch -- so the frame the matching (loose) far RET pops back is
++     * exactly what we push here. */
++    if (pc110_loose_pm()) {
++        sa.env = env;
++        sa.ra = GETPC();
++        sa.sp = env->regs[R_ESP];
++        sa.sp_mask = get_sp_mask(env->segs[R_SS].flags);
++        sa.ss_base = env->segs[R_SS].base;
++        sa.mmu_index = x86_mmu_index_pl(env, env->hflags & HF_CPL_MASK);
++        if (shift) {
++            pushl(&sa, env->segs[R_CS].selector);
++            pushl(&sa, next_eip);
++        } else {
++            pushw(&sa, env->segs[R_CS].selector);
++            pushw(&sa, next_eip);
++        }
++        SET_ESP(sa.sp, sa.sp_mask);
++        {
++            uint32_t lb, ll, lf;
++            pc110_resolve_seg(env, new_cs, 1, &lb, &ll, &lf);
++            pc110_dbg_cs(env, "lcall", new_cs, lb, new_eip);
++            cpu_x86_load_seg_cache(env, R_CS, new_cs, lb, ll, lf);
++        }
++        env->eip = new_eip;
++        return;
++    }
+     if ((new_cs & 0xfffc) == 0) {
+         raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+     }
+@@ -2084,11 +2287,45 @@
+     LOG_PCALL("lret new %04x:" TARGET_FMT_lx " s=%d addend=0x%x\n",
+               new_cs, new_eip, shift, addend);
+     LOG_PCALL_STATE(env_cpu(env));
++    /*
++     * Loose-PM far RET/IRET (PC110, post-boot only).  The driver runs in unreal
++     * mode and returns to real-mode-style CS values (F000, null, in-GDT-but-
++     * invalid selectors) that faithful PM rejects with #GP -- the fault storm
++     * that made EMM386 halt with "error #13".  Match the reference: resolve the
++     * CS base (its GDT descriptor if in-limit, else selector<<4) and complete a
++     * same-privilege return with no type/privilege/present checks.  Genuine V86
++     * returns (IRET with EFLAGS.VM) are left to QEMU's correct path. */
++    if (pc110_loose_pm() && !(is_iret && (new_eflags & VM_MASK))) {
++        uint32_t base, lim, flags;
++        pc110_resolve_seg(env, new_cs, 1, &base, &lim, &flags);
++        pc110_dbg_cs(env, is_iret ? "iret" : "lret", new_cs, base, new_eip);
++        cpu_x86_load_seg_cache(env, R_CS, new_cs, base, lim, flags);
++        sa.sp += addend;
++        SET_ESP(sa.sp, sa.sp_mask);
++        env->eip = new_eip;
++        if (is_iret) {
++            eflags_mask = TF_MASK | AC_MASK | ID_MASK | RF_MASK | NT_MASK;
++            if (cpl == 0) {
++                eflags_mask |= IOPL_MASK;
++            }
++            iopl = (env->eflags >> IOPL_SHIFT) & 3;
++            if (cpl <= iopl) {
++                eflags_mask |= IF_MASK;
++            }
++            if (shift == 0) {
++                eflags_mask &= 0xffff;
++            }
++            cpu_load_eflags(env, new_eflags, eflags_mask);
++        }
++        return;
++    }
+     if ((new_cs & 0xfffc) == 0) {
+         raise_exception_err_ra(env, EXCP0D_GPF, new_cs & 0xfffc, retaddr);
+     }
+     if (load_segment_ra(env, &e1, &e2, new_cs, retaddr) != 0) {
+-        raise_exception_err_ra(env, EXCP0D_GPF, new_cs & 0xfffc, retaddr);
++        if (!pc110_synth_desc(new_cs, 1, &e1, &e2)) {
++            raise_exception_err_ra(env, EXCP0D_GPF, new_cs & 0xfffc, retaddr);
++        }
+     }
+     if (!(e2 & DESC_S_MASK) ||
+         !(e2 & DESC_CS_MASK)) {

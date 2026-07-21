@@ -261,6 +261,7 @@ static unsigned g_lin_ring_pos;
 static uint32_t g_dos_ring[16]; /* ring of recent conventional-mem (<0xA0000) PCs */
 static unsigned g_dos_ring_pos;
 static uint32_t g_last_nonfseg; /* last non-F-seg (DOS/driver) linear PC (diag) */
+static int g_tr_dumps;            /* PC110TRACE idle-ring dumps emitted */
 
 bool pc110_post_intercept(CPUState *cs, vaddr pc);
 bool pc110_post_intercept(CPUState *cs, vaddr pc)
@@ -300,6 +301,42 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
                         "cs=%04X\n", (unsigned)pc, (unsigned)env->cr[0],
                         (int)(env->cr[0] & 1), (unsigned)env->segs[R_CS].selector);
             }
+        }
+    }
+
+    /* PC110TRACE: dump the recent all-segment TB ring on demand -- the test
+     * harness creates /tmp/pc110dump once the machine has settled into its
+     * post-boot idle, and the intercept dumps the ring (the code path leading
+     * into the idle wait: timer ISR + the poll/check that re-halts, i.e. what
+     * the driver is waiting on).  Checked cheaply once per 1024 TBs so it fires
+     * even when the idle loop executes very few TBs. */
+    if (getenv("PC110TRACE") && pc110_booted &&
+        (uint32_t)pc >= 0x8000 && (uint32_t)pc < 0x20000) {
+        /* The machine freezes at a conventional-memory HLT with IF=0, so no TBs
+         * run afterwards -- the ring can only be captured AT the halting block.
+         * Detect a HLT (0xF4) opcode within this TB's first bytes and dump the
+         * ring (the path that led into the halt) as we translate it. */
+        uint8_t bb[24] = {0};
+        cpu_physical_memory_read((uint32_t)pc, bb, sizeof(bb));
+        int has_hlt = 0;
+        for (unsigned bi = 0; bi < sizeof(bb); bi++) {
+            if (bb[bi] == 0xF4) { has_hlt = 1; break; }
+        }
+        if (has_hlt && g_tr_dumps < 8) {
+            fprintf(stderr, "[pc110post] === PC110TRACE ring (dump %d) HLT-blk pc=%05X "
+                    "efl=%08X ===\n", g_tr_dumps, (unsigned)pc,
+                    (unsigned)(env->eflags));
+            for (int k = 0; k < G_LIN_RING_N; k += 16) {
+                char line[256]; int lp = 0;
+                for (int j = 0; j < 16; j++) {
+                    unsigned idx = (g_lin_ring_pos - G_LIN_RING_N + k + j)
+                                   & (G_LIN_RING_N - 1);
+                    lp += snprintf(line + lp, sizeof(line) - lp, "%05X ",
+                                   (unsigned)g_lin_ring[idx]);
+                }
+                fprintf(stderr, "   %s\n", line);
+            }
+            g_tr_dumps++;
         }
     }
 
@@ -578,15 +615,23 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
      * (they dispatch to A6E4 anyway).  Gated on pc110_booted so pre-boot POST,
      * which legitimately cold/warm-POSTs, is untouched. */
     if (csbase == 0xF0000 && off == 0x4656 && pc110_booted &&
-        !getenv("PC110NORESUME")) {
+        getenv("PC110RESUME")) { /* legacy A6E4 redirect; loose-PM replaced it */
         if (getenv("PC110RSTLOG")) {
             static int seen;
             if (seen++ < 32) {
                 uint8_t v67[4] = {0};
                 cpu_physical_memory_read(0x00000467, v67, 4);
+                /* A6E4 will: ss=[40:69], sp=[40:67], pop ds/es, popa (16),
+                 * retf 2.  So the CS:IP it returns to sits at SS:SP+20/+22.
+                 * Read it to see whether the saved resume frame is valid. */
+                uint16_t ss = v67[2] | (v67[3] << 8);
+                uint16_t sp = v67[0] | (v67[1] << 8);
+                uint32_t fr = ((uint32_t)ss << 4) + sp;
+                uint8_t frm[4] = {0};
+                cpu_physical_memory_read(fr + 20, frm, 4);
                 fprintf(stderr, "[pc110post] FORCE-RESUME @4656 -> A6E4  "
-                        "40:67=%02X%02X:%02X%02X\n",
-                        v67[3], v67[2], v67[1], v67[0]);
+                        "SS:SP=%04X:%04X retf-> %02X%02X:%02X%02X\n",
+                        ss, sp, frm[3], frm[2], frm[1], frm[0]);
             }
         }
         env->eip = 0xA6E4;
