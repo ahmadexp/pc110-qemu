@@ -196,9 +196,15 @@ Enabled by `PC110SETUP=1`:
   does not load EMM386 (see [Booting the real BIOS](#booting-the-real-bios)).
   Booting the stock EMM386 configuration on the real BIOS is future work (needs a
   V86-aware loose-PM model).
-- Easy-Setup renders and its menu is navigable, but it still calls a few PC110
-  BIOS service routines that don't exist under SeaBIOS, so some in-menu actions
-  may not fully function; entering it and exiting back to Personaware work.
+- Easy-Setup on the **real BIOS** (`run-easysetup-realbios.sh`) is fully
+  navigable: the main menu and every panel open and render from the genuine ROM
+  — Config (Memory / Keyboard / Serial / Parallel / SystemBoard / Initialize,
+  and its nested settings dialogs, e.g. Keyboard's Typematic / Pointing OK/Cancel
+  dialog), Date-Time (year/time spin editor), Start up (boot-device order), and
+  Test (hardware-diagnostics menu). On the **SeaBIOS-shim** path
+  (`run-easysetup.sh`) the same program runs but a few in-menu *actions* call
+  PC110 BIOS services SeaBIOS lacks, so they may not fully function; entering and
+  exiting back to Personaware work on both paths.
 
 ## Credits
 
