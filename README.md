@@ -14,11 +14,12 @@ obtained dumps (see [`roms/`](roms/README.md) and [`disks/`](disks/README.md)).
 
 ## What works
 
-- **Personaware on the real PC110 BIOS** (`scripts/run-realbios.sh`) — the
-  genuine 256 KiB ROM POSTs, boots DOS, runs the RIOS driver stack, hands off to
-  VGA mode 12h and paints the full pen launcher with kanji from the font ROM.
-  See [Booting the real BIOS](#booting-the-real-bios) for how, and the note there
-  about running a `CONFIG.SYS` without EMM386.
+- **Authentic power-on on the genuine BIOS** (`scripts/run-realbios.sh`) — the
+  real 256 KiB ROM POSTs with its own on-screen POST codes ending in
+  "Starting PC DOS...", a power-on beep, and a "Press F1 for Easy-Setup" prompt.
+  Press F1 (promptly) to enter Easy-Setup; otherwise it boots DOS, runs the RIOS
+  driver stack, hands off to VGA mode 12h, and paints the full pen launcher with
+  kanji from the font ROM. See [Booting the real BIOS](#booting-the-real-bios).
 - **Personaware on SeaBIOS** boots to the same full pen-driven launcher
   (Schedule, ToDo, Notebook, Address, E-Mail, FAX, Telephone, IR Connect, World
   Clock, Calculator, Editor, Draw Memo, Game, Personal, DOS, Power MGT) with
@@ -26,9 +27,17 @@ obtained dumps (see [`roms/`](roms/README.md) and [`disks/`](disks/README.md)).
   the real unit's internal storage) so it boots straight to a clean launcher — a
   disk with 512-byte clusters trips a bogus "low disk space" dialog regardless of
   how much is free (see [`disks/`](disks/README.md)).
-- **Easy-Setup** (the real graphical F1 BIOS setup: Config / Date-Time /
-  Password / Start up / Test / Restart) runs under SeaBIOS and renders from the
-  genuine BIOS ROM. Exiting it returns to normal Personaware mode.
+- **Easy-Setup** (the real graphical BIOS setup: Config / Date-Time / Password /
+  Start up / Test / Restart) runs and renders from the genuine BIOS ROM — reached
+  by F1 during the real-BIOS POST, directly via `run-easysetup-realbios.sh`, or
+  under SeaBIOS. Its menu and panels are navigable and Exit/Restart returns to the
+  normal boot.
+- **PC-speaker audio** — the PC110's sound (PIT channel 2 gated by port `0x61`)
+  is wired to a host backend so beeps are audible. See
+  [Audio and CPU speed](#audio-and-cpu-speed).
+- **Authentic ~33 MHz CPU** — the guest is paced to the real 33 MHz 486 clock via
+  QEMU `-icount` (instead of running as fast as the host). See
+  [Audio and CPU speed](#audio-and-cpu-speed).
 
 ## How it works
 
@@ -95,10 +104,14 @@ python3 tools/make-disk.py your-pc110-dump.img disks/Personaware-disk.img
 ./boot/build-floppy.sh
 
 # 4. Run
-./scripts/run-personaware.sh     # Personaware GUI (SeaBIOS)
-./scripts/run-easysetup.sh       # Easy-Setup BIOS (Exit -> Personaware)
-./scripts/run-realbios.sh        # boot the REAL BIOS (experimental, see below)
+./scripts/run-realbios.sh            # REAL BIOS: authentic POST + beep + F1 -> Personaware or Easy-Setup
+./scripts/run-easysetup-realbios.sh  # REAL BIOS: straight into Easy-Setup
+./scripts/run-personaware.sh         # Personaware GUI (SeaBIOS)
+./scripts/run-easysetup.sh           # Easy-Setup via SeaBIOS (Exit -> Personaware)
 ```
+
+All run scripts pace the CPU to ~33 MHz and route PC-speaker audio to the host
+(see [Audio and CPU speed](#audio-and-cpu-speed)).
 
 The QEMU window opens at 2x the guest resolution (the PC110 screen is tiny on a
 high-DPI/Retina Mac); set `QEMU_COCOA_SCALE=N` to change it (1 = native). It is
@@ -161,9 +174,35 @@ How it works (`qemu/target-i386/pc110post.c` + `qemu/patches/`):
   DOS UMB that becomes writable after boot, F0000-FFFFF shadow RAM) and the
   VLSI/SCAMP + CMOS register banks seeded from a real-hardware dump.
 
-Set `PC110RSTLOG=1` for verbose reset/driver tracing; `PC110HEARTBEAT=1` samples
-where non-BIOS code executes; `PC110RESUME=1` re-enables the legacy A6E4
-reset-resume shim (superseded by loose PM).
+Completer env vars: `PC110POST=1` enables the completer (reads `PC110BOOT`);
+`PC110POSTUI=1` turns on the [realistic boot](#realistic-boot-post-beep-and-f1);
+`PC110SETUP=1` forces the [F1-at-POST Easy-Setup](#easy-setup-via-f1-on-the-real-bios)
+outcome (with `PC110SETUPIMG` = the extracted program, `PC110SETUPHD=1` to select
+its diagnostics page); `PC110NOPALFIX=1` disables the Easy-Setup palette fix;
+`PC110RSTLOG=1` gives verbose reset/driver tracing; `PC110HEARTBEAT=1` samples where
+non-BIOS code executes; `PC110RESUME=1` re-enables the legacy A6E4 reset-resume shim
+(superseded by loose PM). The run scripts also read the host-side `PC110_AUDIODEV`
+and `PC110_ICOUNT` (see [Audio and CPU speed](#audio-and-cpu-speed)).
+
+### Realistic boot (POST, beep, and F1)
+
+`scripts/run-realbios.sh` is the authentic power-on sequence (env `PC110POSTUI=1`,
+on by default in that script; `PC110POSTUI=0` boots straight to Personaware):
+
+- **Genuine POST on screen.** The BIOS POST writes its progress with `INT 10h`
+  teletype (`F000:542C`), but the PC110 leaves the main VGA in an uninitialised
+  mode (it uses its C&T flat panel and front LCD), so under `-vga std` that output
+  was invisible. At the first teletype the completer injects a genuine
+  `INT 10h AX=0003` (via the real VGA BIOS, returning through a sentinel) so 80×25
+  text renders — showing the real POST checkpoint codes and `Starting PC DOS...`.
+- **Power-on beep** — a short PC-speaker tone (PIT ch2).
+- **"Press F1 for Easy-Setup"** prompt. A key pressed while the POST is on screen
+  is seen at the boot decision (`F000:52BD`) and enters Easy-Setup; otherwise
+  Personaware boots. The window is short (~1 s): the emulated POST reaches its
+  boot decision quickly and can't be paused there (a halted CPU that early has no
+  timer IRQ to wake it, and any busy wait either starves host input under the BQL
+  or TB-chains), so press F1 promptly. A real keypress is detected via a small
+  PS/2 hook (`qemu/patches/06-ps2-pc110-keywatch.patch`).
 
 ### Easy-Setup via F1 on the real BIOS
 
@@ -183,15 +222,43 @@ Enabled by `PC110SETUP=1`:
   `5000:0000`.
 - Easy-Setup reads the **POST error log** via `INT 15h AH=21h AL=00h` and shows
   its `⊘ERROR` diagnostics screen whenever the log is non-empty; the emulated
-  POST logs spurious entries, so `PC110SETUP` forces that service to return an
-  **empty** log (`BH=0`, CF clear) — so Easy-Setup opens the config menu. (This
-  is why the SeaBIOS-shim Easy-Setup path — `run-easysetup.sh` — exists too:
-  it's the same extracted program run without the real BIOS.)
+  POST logs spurious entries, so `PC110SETUP` (and the `PC110POSTUI` F1 path)
+  force that service to return an **empty** log (`BH=0`, CF clear) — so Easy-Setup
+  opens the config menu. (This is why the SeaBIOS-shim Easy-Setup path —
+  `run-easysetup.sh` — exists too: it's the same extracted program run without the
+  real BIOS.)
+- **Palette fix.** Easy-Setup picks its menu colours from a colour-*theme*
+  selector; because we enter the extracted program directly at `5000:0000` (past
+  the ROM's pre-entry init), its first draws came up "blue-ish" and only corrected
+  to the intended rose after navigating. The loader aliases theme block 0 to the
+  correct block (copying the 9 rose bytes at image `0xBCFF` over `0xBCF6`) so every
+  draw is right from the start. Disable with `PC110NOPALFIX=1`.
+
+## Audio and CPU speed
+
+Both are wired into every run script and are overridable by env var.
+
+- **Audio.** The PC110's sound is the PC speaker (PIT channel 2 gated by port
+  `0x61`), the same path the reference emulator models. QEMU's built-in PC speaker
+  is connected to a host audio backend with
+  `-audiodev "$PC110_AUDIODEV",id=snd0 -machine pcspk-audiodev=snd0`.
+  `PC110_AUDIODEV` defaults to `coreaudio` (macOS); set it to `pa` / `pipewire` /
+  `alsa` on other hosts, or `none` to mute. Idle is silent; beeps (POST, Easy-Setup
+  keypresses) play.
+- **CPU speed (~33 MHz).** By default TCG runs the guest as fast as the host, so
+  the boot and UI run far faster than a real PC110. `-icount shift=5` paces each
+  instruction to 32 ns of virtual time throttled to real time — ≈ 31 MHz, the
+  nearest power-of-two step to the real 33 MHz 486 (QEMU `-icount` only takes
+  power-of-two shifts). Override with `PC110_ICOUNT` (e.g. `shift=4` ≈ 62 MHz,
+  `shift=6` ≈ 16 MHz), or set it empty to run at full host speed.
 
 ## Status / limitations
 
 - **Personaware** (both the real-BIOS and SeaBIOS paths) and **Easy-Setup** all
-  reach their GUIs.
+  reach their GUIs, with PC-speaker audio and ~33 MHz CPU pacing on by default.
+- The real-BIOS **POST + "Press F1" window** works but is short (~1 s), because the
+  emulated boot reaches its decision point quickly and can't be held there — press
+  F1 promptly (see [Realistic boot](#realistic-boot-post-beep-and-f1)).
 - The **real-BIOS** path reaches the Personaware desktop with a `CONFIG.SYS` that
   does not load EMM386 (see [Booting the real BIOS](#booting-the-real-bios)).
   Booting the stock EMM386 configuration on the real BIOS is future work (needs a
