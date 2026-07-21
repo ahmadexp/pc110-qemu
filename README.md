@@ -165,6 +165,29 @@ Set `PC110RSTLOG=1` for verbose reset/driver tracing; `PC110HEARTBEAT=1` samples
 where non-BIOS code executes; `PC110RESUME=1` re-enables the legacy A6E4
 reset-resume shim (superseded by loose PM).
 
+### Easy-Setup via F1 on the real BIOS
+
+`scripts/run-easysetup-realbios.sh` takes the **F1-at-POST** branch into
+Easy-Setup on the real BIOS and shows the graphical config menu (Config /
+Date-Time / Password / Start up / Test / Restart):
+
+![Easy-Setup config menu on the real BIOS](docs/easysetup-realbios.png)
+
+Enabled by `PC110SETUP=1`:
+
+- At the boot decision point (`F000:52BD`) it takes the ROM's F1 outcome
+  (`F000:3273` → `F000:3391` = Easy-Setup) instead of booting the disk. Because
+  the ROM's *live* LZW decompress+enter stalls under emulation, it loads the
+  **extracted** Easy-Setup program (`PC110SETUPIMG`, unpacked by
+  `boot/build-floppy.sh`) to `0x50000` and enters it at the real entry
+  `5000:0000`.
+- Easy-Setup reads the **POST error log** via `INT 15h AH=21h AL=00h` and shows
+  its `⊘ERROR` diagnostics screen whenever the log is non-empty; the emulated
+  POST logs spurious entries, so `PC110SETUP` forces that service to return an
+  **empty** log (`BH=0`, CF clear) — so Easy-Setup opens the config menu. (This
+  is why the SeaBIOS-shim Easy-Setup path — `run-easysetup.sh` — exists too:
+  it's the same extracted program run without the real BIOS.)
+
 ## Status / limitations
 
 - **Personaware** (both the real-BIOS and SeaBIOS paths) and **Easy-Setup** all

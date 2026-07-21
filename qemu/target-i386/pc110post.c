@@ -304,6 +304,36 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
         }
     }
 
+    /* PC110ESLOG: log Easy-Setup's service dispatcher (5F23:0002 = linear
+     * 0x5F232) call sequence -- AH/AL select an INT 15h function (its self-check
+     * queries hardware this way).  Reveals which service returns the value that
+     * trips the error screen. */
+    if ((uint32_t)pc == 0x0005F232) {
+        unsigned ah = (env->regs[R_EAX] >> 8) & 0xFF;
+        unsigned al = env->regs[R_EAX] & 0xFF;
+        if (getenv("PC110ESLOG")) {
+            static int esn;
+            if (esn++ < 120) {
+                fprintf(stderr, "[pc110post] ES-SVC ah=%02X al=%02X bx=%04X "
+                        "cx=%04X\n", ah, al, (unsigned)(env->regs[R_EBX] & 0xFFFF),
+                        (unsigned)(env->regs[R_ECX] & 0xFFFF));
+            }
+        }
+        /* Easy-Setup reads the POST error log via INT 15h AH=21h AL=00h and shows
+         * its ERROR screen (Test/Restart) whenever the log is non-empty.  Our
+         * emulated POST logs spurious entries (the completer's reset/probe
+         * anomalies), so under PC110SETUP force an EMPTY log -- BH=0 (count),
+         * CF=0 -- so Easy-Setup opens the config menu instead.  Skip the real
+         * INT 15h (jump past it to the dispatcher's retf at 0x5F239). */
+        if (getenv("PC110SETUP") && ah == 0x21 && al == 0x00) {
+            env->regs[R_EAX] &= 0xFFFF00FFu;         /* AH = 0 (status ok) */
+            env->regs[R_EBX] &= 0xFFFF0000u;         /* BX = 0 (BH count = 0) */
+            env->eflags &= ~0x1u;                    /* CF = 0 (success) */
+            env->eip = 0x5F239 - 0x5F230;            /* -> retf (CS base 0x5F230) */
+            return true;
+        }
+    }
+
     /* PC110TRACE: dump the recent all-segment TB ring on demand -- the test
      * harness creates /tmp/pc110dump once the machine has settled into its
      * post-boot idle, and the intercept dumps the ring (the code path leading
@@ -394,6 +424,22 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
 
     uint16_t prev_off = g_prev_off; /* previous F-seg TB offset (reset-caller diag) */
     g_prev_off = off;
+
+    /* DIAGNOSTIC (PC110RSTLOG): the POST keyboard-scancode dispatch at
+     * F000:3243..3398 routes special keys read during POST; F1 (AL=0x3B) at
+     * F000:3273 jumps to F000:3391 = enter Easy-Setup.  Log which dispatch TBs
+     * POST reaches and the scancode in AL, to see why an injected F1 doesn't
+     * take the setup branch. */
+    if (csbase == 0xF0000 && off >= 0x3240 && off <= 0x3398 &&
+        getenv("PC110RSTLOG")) {
+        static unsigned char kbseen[0x160];
+        unsigned k = off - 0x3240;
+        if (k < sizeof(kbseen) && kbseen[k] < 3) {
+            kbseen[k]++;
+            fprintf(stderr, "[pc110post] KBDISP @%04X AL=%02X\n",
+                    (unsigned)off, (unsigned)(env->regs[R_EAX] & 0xFF));
+        }
+    }
 
     /*
      * KBC warm reset F000:5516 = MOV AL,0FE / OUT 64,AL.  The PC110 pulses the
@@ -661,6 +707,54 @@ bool pc110_post_intercept(CPUState *cs, vaddr pc)
             fprintf(stderr, "[pc110post] INT19 @F000:52BD hit #%d  "
                     "after %d resets  (booted=%d)\n",
                     ++h52, g_reset_count, pc110_booted);
+        }
+        /* PC110SETUP: take the F1-at-POST outcome -- enter the ROM's OWN
+         * Easy-Setup instead of booting the disk.  The BIOS's Easy-Setup entry
+         * is F000:3391 (the F1 scancode branch from F000:3273); our POST
+         * completer bypasses the keyboard dispatch, so jump there directly at
+         * the boot decision point. */
+        if (!pc110_booted && getenv("PC110SETUP")) {
+            static int once;
+            if (!once++) {
+                const char *img = getenv("PC110SETUPIMG");
+                if (img && img[0]) {
+                    /* Authentic F1 outcome, robust entry: load the Easy-Setup
+                     * program (the same image the ROM decompresses out of its
+                     * LZW container) to physical 0x50000 and enter it at its
+                     * real entry 5000:0000 -- the ROM's own live decompress+
+                     * relocate stalls under emulation, so use the extracted
+                     * image and the known-good entry point. */
+                    FILE *sf = fopen(img, "rb");
+                    if (sf) {
+                        static uint8_t sbuf[300000];
+                        size_t n = fread(sbuf, 1, sizeof(sbuf), sf);
+                        fclose(sf);
+                        cpu_physical_memory_write(0x00050000, sbuf, n);
+                        env->segs[R_CS].selector = 0x5000;
+                        env->segs[R_CS].base = 0x00050000;
+                        env->segs[R_DS].selector = 0; env->segs[R_DS].base = 0;
+                        env->segs[R_ES].selector = 0; env->segs[R_ES].base = 0;
+                        env->segs[R_SS].selector = 0; env->segs[R_SS].base = 0;
+                        env->regs[R_ESP] = 0x7000;
+                        /* DL = boot drive: 0 (floppy) selects Easy-Setup's config
+                         * menu; 0x80 (HD) selects the diagnostics page.  Default
+                         * to the config menu; PC110SETUPHD forces diagnostics. */
+                        env->regs[R_EDX] = getenv("PC110SETUPHD") ? 0x80 : 0x00;
+                        env->eip = 0;
+                        if (getenv("PC110RSTLOG")) {
+                            fprintf(stderr, "[pc110post] PC110SETUP: loaded %zu-byte "
+                                    "Easy-Setup image, entering 5000:0000\n", n);
+                        }
+                        return true;
+                    }
+                }
+                if (getenv("PC110RSTLOG")) {
+                    fprintf(stderr, "[pc110post] PC110SETUP: entering ROM Easy-Setup "
+                            "@F000:3391 (set PC110SETUPIMG for extracted image)\n");
+                }
+                env->eip = 0x3391;
+                return true;
+            }
         }
         const char *bootpath = getenv("PC110BOOT");
         if (!pc110_booted && bootpath && bootpath[0]) {
